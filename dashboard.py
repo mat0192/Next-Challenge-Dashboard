@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 st.set_page_config(page_title="Risk Terminal", layout="wide")
 st.title("Terminal de Risque - Front Office 📈")
