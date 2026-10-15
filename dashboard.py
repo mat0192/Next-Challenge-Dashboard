@@ -188,7 +188,7 @@ try:
     mc_param_ser = pd.Series(mc_param_euro, index=assets)
     hist_mc_ser = pd.Series(hist_mc_euro, index=assets)
     contrib_vol_ser = pd.Series(contrib_vol_euro, index=assets)
-    weights_ser = pd.Series(weights_total * 100, index=assets)
+    weights_ser = (weights_total * 100).rename(index=company_names)
     vol_indiv = (returns.std() * np.sqrt(252) * 100).rename(index=company_names)
 
     # --- BANDEAU DE MÉTRIQUES SUPÉRIEUR ---
@@ -352,7 +352,11 @@ try:
         col_sim1, col_sim2 = st.columns(2)
 
         with col_sim1:
-            actif_choisi = st.selectbox("Choisis la ligne à renforcer ou alléger :", list(company_names.values()))
+            actif_choisi = st.selectbox(
+                "Choisis la ligne à renforcer ou alléger :",
+                list(portfolio_positions.keys()),
+                format_func=lambda ticker: company_names.get(ticker, ticker)
+            )
             sens_ordre = st.radio("Sens de l'opération :", ["Achat (Renforcement)", "Vente (Allègement)"], horizontal=True)
             qte_sim = st.number_input("Quantité de titres à traiter :", min_value=1, value=10, step=1)
 
@@ -391,7 +395,7 @@ try:
             if nouveau_cash < 0:
                 st.error(f"❌ Ordre rejeté : Liquidités insuffisantes (Il manque {abs(nouveau_cash):,.2f} €).")
             elif nouveau_poids > 15.0:
-                st.error(f"🚨 ALERTE CONFORMITÉ : Cet achat fait passer {actif_choisi} à {nouveau_poids:.2f} % (Plafond autorisé : 15,00 %).")
+                st.error(f"🚨 ALERTE CONFORMITÉ : Cet achat fait passer {company_names.get(actif_choisi, actif_choisi)} à {nouveau_poids:.2f} % (Plafond autorisé : 15,00 %).")
             else:
                 st.success(f"✅ Ordre valide ! Nouveau solde espèces après exécution : {nouveau_cash:,.2f} €.")
 
@@ -441,3 +445,4 @@ try:
 
 except Exception as e:
     st.error(f"Erreur serveur : {e}")
+
