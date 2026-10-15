@@ -3,6 +3,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+# optional: try import for normal ppf
+try:
+    from scipy.stats import norm
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
 st.set_page_config(page_title="Risk Terminal - Front Office", layout="wide")
 st.title("Terminal de Risque & Aide à la Décision 📈")
 st.subheader("Portefeuille Next Challenge — Euronext")
@@ -56,39 +63,81 @@ try:
     perf_globale_euro = valeur_totale_portefeuille - apport_initial
     perf_globale_pct = (perf_globale_euro / apport_initial) * 100
 
-    # Modélisation Quantitative (VaR, CVaR, Volatilité, Bêta vs CAC 40)
-    weights_risk = position_values / total_actions
+    # Rendements journaliers des actions
     returns = data.pct_change().dropna()
 
-    # Portefeuille actions pondéré (rendement des actions seulement)
-    portfolio_returns_actions = returns.dot(weights_risk)
+    # Poids
+    weights_actions = position_values / total_actions
+    weights_total = position_values / valeur_totale_portefeuille  # includes cash implicitly (cash weight = cash/total)
 
-    # Portefeuille total inclut la trésorerie : on impose un rendement de 0% pour le cash
-    weights_total = position_values / valeur_totale_portefeuille
-    portfolio_returns_total = returns.dot(weights_total)
+    # Rendements portfolios
+    portfolio_returns_actions = returns.dot(weights_actions)
+    portfolio_returns_total = returns.dot(weights_total)  # cash return = 0 implicitly
 
-    # VaR / CVaR historiques sur base du portefeuille total (actions + cash)
+    # Historical VaR/CVaR (1-day) on total portfolio (actions + cash)
     alpha = 0.95
     q_loss = np.percentile(portfolio_returns_total, 100 * (1 - alpha))
-    var_pct = -q_loss
-    var_euro = var_pct * valeur_totale_portefeuille
+    hist_var_pct = -q_loss
+    hist_var_euro = hist_var_pct * valeur_totale_portefeuille
 
     cvar_mask = portfolio_returns_total <= q_loss
     if cvar_mask.sum() > 0:
-        cvar_pct = -portfolio_returns_total[cvar_mask].mean()
+        hist_cvar_pct = -portfolio_returns_total[cvar_mask].mean()
     else:
-        cvar_pct = 0.0
-    cvar_euro = cvar_pct * valeur_totale_portefeuille
+        hist_cvar_pct = 0.0
+    hist_cvar_euro = hist_cvar_pct * valeur_totale_portefeuille
 
-    vol_annuelle = portfolio_returns_total.std() * np.sqrt(252) * 100
+    # Parametric VaR (variance-covariance) using normal assumption
+    mu_assets = returns.mean()
+    mu_portfolio = portfolio_returns_total.mean()
+    Sigma = returns.cov()  # daily covariance
 
+    # portfolio daily std (including cash as zero-return)
+    w = weights_total.values
+    Sigma_mat = Sigma.values
+    port_var_daily = float(w @ Sigma_mat @ w)
+    port_std_daily = np.sqrt(port_var_daily)
+    # annualize
+    port_std_annual = port_std_daily * np.sqrt(252)
+
+    # get z for alpha
+    if _HAS_SCIPY:
+        z = -norm.ppf(1 - alpha)
+    else:
+        # fallback approximate for 95%
+        z = 1.6448536269514722 if alpha == 0.95 else 2.3263478740408408
+
+    # parametric VaR pct (positive number)
+    param_var_pct = -(mu_portfolio + (-z) * port_std_daily)
+    # since z above is positive, use more stable formula: -(mu + z * std)
+    param_var_pct = -(mu_portfolio + (-z) * port_std_daily) if False else -(mu_portfolio - z * port_std_daily)
+    # Correct formula: VaR = -(mu_portfolio + z_alpha * port_std_daily) where z_alpha is negative quantile
+    # Using z_pos = -norm.ppf(1-alpha) so z_pos>0, VaR_pct = -(mu_portfolio - z_pos * port_std_daily)
+    z_pos = z
+    param_var_pct = -(mu_portfolio - z_pos * port_std_daily)
+    param_var_euro = param_var_pct * valeur_totale_portefeuille
+
+    # Parametric CVaR (Gaussian) approximation: cvar = -(mu - (pdf(z)/(1-alpha)) * std) where z = norm.ppf(1-alpha)
+    if _HAS_SCIPY:
+        z_q = norm.ppf(1 - alpha)
+        pdf_z = norm.pdf(z_q)
+        param_cvar_pct = -(mu_portfolio + (pdf_z / (1 - alpha)) * port_std_daily)
+    else:
+        # fallback: approximate parametric CVaR with historical CVaR
+        param_cvar_pct = hist_cvar_pct
+    param_cvar_euro = param_cvar_pct * valeur_totale_portefeuille
+
+    # Vol annualisée (total portfolio)
+    vol_annuelle = port_std_daily * np.sqrt(252) * 100
+
+    # Beta vs CAC40 (use portfolio of actions only)
     cac_returns = cac_data.pct_change().dropna()
     aligned = pd.concat([portfolio_returns_actions, cac_returns], axis=1).dropna()
     aligned.columns = ['Portefeuille', 'CAC40']
     cov_matrix = np.cov(aligned['Portefeuille'], aligned['CAC40'])
     beta_portefeuille = cov_matrix[0, 1] / cov_matrix[1, 1]
 
-    # Calcul des Indicateurs Techniques (RSI 14J Wilder, Moyenne Mobile 20J, Perf 5J)
+    # RSI (Wilder) 14J
     delta = data.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -96,45 +145,70 @@ try:
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_14 = 100 - (100 / (1 + rs))
-    rsi_14 = rsi_14.fillna(0)
-    rsi_14[(avg_loss == 0) & (avg_gain > 0)] = 100
-    rsi_14[(avg_loss == 0) & (avg_gain == 0)] = 50
-    rsi_14 = rsi_14.iloc[-1]
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(0)
+    rsi[(avg_loss == 0) & (avg_gain > 0)] = 100
+    rsi[(avg_loss == 0) & (avg_gain == 0)] = 50
+    rsi_14 = rsi.iloc[-1]
 
     sma_20 = data.rolling(window=20).mean().iloc[-1]
     ecart_sma20 = ((current_prices - sma_20) / sma_20) * 100
     perf_5j = ((current_prices - data.iloc[-6]) / data.iloc[-6]) * 100
 
-    # Traduction des tickers en noms d'entreprises
-    position_values.index = position_values.index.map(company_names)
-    current_prices.index = current_prices.index.map(company_names)
-    buy_prices.index = buy_prices.index.map(company_names)
-    quantities.index = quantities.index.map(company_names)
-    pnl_euro.index = pnl_euro.index.map(company_names)
-    pnl_pct.index = pnl_pct.index.map(company_names)
-    returns.columns = returns.columns.map(company_names)
-    rsi_14.index = rsi_14.index.map(company_names)
-    ecart_sma20.index = ecart_sma20.index.map(company_names)
-    perf_5j.index = perf_5j.index.map(company_names)
+    # Risk decomposition: parametric marginal contributions (Euler) and historical contributions
+    # Parametric marginal contribution (pct): MC_i = -(w_i * mu_i + z_pos * (Sigma@w)_i / port_std_daily)
+    mu_i = mu_assets
+    Sigma_w = Sigma_mat @ w
+    # avoid divide by zero
+    if port_std_daily == 0:
+        mc_param_pct = np.zeros_like(w)
+    else:
+        mc_param_pct = -(w * mu_i.values + z_pos * (Sigma_w / port_std_daily))
+    mc_param_euro = mc_param_pct * valeur_totale_portefeuille
+
+    # Historical marginal contributions via tail average
+    tail_idx = portfolio_returns_total <= q_loss
+    if tail_idx.sum() > 0:
+        contribs_assets = returns[tail_idx].multiply(weights_total, axis=1)
+        hist_mc_pct = -contribs_assets.mean().values  # positive contributions to loss
+    else:
+        hist_mc_pct = np.zeros(len(w))
+    hist_mc_euro = hist_mc_pct * valeur_totale_portefeuille
+
+    # Volatility contributions (variance decomposition)
+    # variance contribution daily: w_i * (Sigma@w)_i
+    var_contrib_daily = w * Sigma_w
+    total_var_daily = port_var_daily if port_var_daily > 0 else 1.0
+    share_var = var_contrib_daily / total_var_daily
+    # contribution in euros approximated as share_var * portfolio annual std * portfolio value
+    contrib_vol_euro = share_var * (port_std_daily * np.sqrt(252)) * valeur_totale_portefeuille
+
+    # Prepare display series with company names
+    assets = list(company_names.values())
+    mc_param_ser = pd.Series(mc_param_euro, index=assets)
+    hist_mc_ser = pd.Series(hist_mc_euro, index=assets)
+    contrib_vol_ser = pd.Series(contrib_vol_euro, index=assets)
+    weights_ser = pd.Series(weights_total * 100, index=assets)
+    vol_indiv = (returns.std() * np.sqrt(252) * 100).rename(index=company_names)
 
     # --- BANDEAU DE MÉTRIQUES SUPÉRIEUR ---
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Valorisation Totale", f"{valeur_totale_portefeuille:,.2f} €", f"{perf_globale_pct:.2f} % ({perf_globale_euro:+.2f} €)")
     col2.metric("Titres Investis", f"{total_actions:,.2f} €", f"{(total_actions/valeur_totale_portefeuille)*100:.1f} % du total")
     col3.metric("Cash Disponible", f"{liquidites_actuelles:,.2f} €", f"{(liquidites_actuelles/valeur_totale_portefeuille)*100:.1f} % du total")
-    col4.metric("VaR (95%) 1J", f"{var_euro:,.2f} €", f"{var_pct*100:.2f} %", delta_color="inverse")
-    col5.metric("CVaR (Krach 5%) 1J", f"{cvar_euro:,.2f} €", f"{cvar_pct*100:.2f} %", delta_color="inverse")
-    col6.metric("Bêta (vs CAC 40)", f"{beta_portefeuille:.2f}", f"Vol. 1A : {vol_annuelle:.1f} %", delta_color="off")
+    col4.metric("VaR Hist. (95%) 1J", f"{hist_var_euro:,.0f} €", f"{hist_var_pct*100:.2f} %", delta_color="inverse")
+    col5.metric("VaR Param. (95%) 1J", f"{param_var_euro:,.0f} €", f"{param_var_pct*100:.2f} %", delta_color="inverse")
+    col6.metric("CVaR Hist. (5%) 1J", f"{hist_cvar_euro:,.0f} €", f"{hist_cvar_pct*100:.2f} %", delta_color="inverse")
 
     st.write("---")
 
     # --- NAVIGATION PAR ONGLETS ---
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🚨 Conformité, PnL & Capacité d'Achat",
         "🎯 Signaux Quantitatifs & Timing",
         "📊 Analyse de Risque & Corrélation",
-        "🛠️ Simulateur d'Ordres (Pre-Trade)"
+        "🛠️ Simulateur d'Ordres (Pre-Trade)",
+        "📉 Stress & Décomposition du Risque"
     ])
 
     with tab1:
@@ -246,7 +320,6 @@ try:
         col_chart, col_corr = st.columns(2)
         with col_chart:
             st.write("### Contribution au Risque (Volatilité Annuelle par Actif)")
-            vol_indiv = (returns.std() * np.sqrt(252) * 100).sort_values(ascending=False)
             st.bar_chart(vol_indiv)
 
         with col_corr:
@@ -321,6 +394,50 @@ try:
                 st.error(f"🚨 ALERTE CONFORMITÉ : Cet achat fait passer {actif_choisi} à {nouveau_poids:.2f} % (Plafond autorisé : 15,00 %).")
             else:
                 st.success(f"✅ Ordre valide ! Nouveau solde espèces après exécution : {nouveau_cash:,.2f} €.")
+
+    with tab5:
+        st.write("### Stress Tests & Décomposition du Risque")
+        st.write("Scénarios simples (impact direct sur cours des actions)")
+        shocks = st.slider("Choisis un choc de marché (uniform pour tous les titres) :", -50, 0, -10, step=5)
+        shocks_pct = shocks / 100.0
+
+        # Scenario impact
+        shocked_values = position_values * (1 + shocks_pct)
+        impact_euro = position_values.sum() - shocked_values.sum()
+        impact_pct = (impact_euro / valeur_totale_portefeuille) * 100
+        st.metric(f"Impact du choc {shocks}% sur la valeur", f"-{impact_euro:,.2f} €", f"-{impact_pct:.2f} %")
+
+        st.write("---")
+        st.write("### Décomposition du risque (contributions à la VaR)")
+        df_contrib = pd.DataFrame({
+            "Poids (%)": weights_ser,
+            "Vol. Ann. (%)": vol_indiv,
+            "Contrib VaR Param (€)": mc_param_ser,
+            "Contrib VaR Hist (€)": hist_mc_ser,
+            "Contrib Vol (€ approx.)": contrib_vol_ser
+        })
+        df_contrib = df_contrib.sort_values(by="Contrib VaR Param (€)", ascending=False)
+        st.dataframe(df_contrib.style.format({
+            "Poids (%)": "{:.2f} %",
+            "Vol. Ann. (%)": "{:.2f} %",
+            "Contrib VaR Param (€)": "{:,.0f} €",
+            "Contrib VaR Hist (€)": "{:,.0f} €",
+            "Contrib Vol (€ approx.)": "{:,.0f} €"
+        }), use_container_width=True)
+
+        st.write("### Graphique : Contributions à la VaR (paramétrique vs historique)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.bar_chart(mc_param_ser.sort_values(ascending=False))
+        with c2:
+            st.bar_chart(hist_mc_ser.sort_values(ascending=False))
+
+        st.write("---")
+        st.write("### Détails supplémentaires : Parametric vs Historical VaR/CVaR")
+        st.write(f"VaR historique (95%) : {hist_var_euro:,.2f} € ({hist_var_pct*100:.2f} %)")
+        st.write(f"CVaR historique (5%) : {hist_cvar_euro:,.2f} € ({hist_cvar_pct*100:.2f} %)")
+        st.write(f"VaR paramétrique (95%) : {param_var_euro:,.2f} € ({param_var_pct*100:.2f} %)")
+        st.write(f"CVaR paramétrique (5%) : {param_cvar_euro:,.2f} € ({param_cvar_pct*100:.2f} %)")
 
 except Exception as e:
     st.error(f"Erreur serveur : {e}")
