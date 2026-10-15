@@ -39,7 +39,7 @@ def load_data():
 try:
     raw_data = load_data()
     cac_data = raw_data["^FCHI"].dropna()
-    data = raw_data[list(portfolio_positions.keys())]
+    data = raw_data[list(portfolio_positions.keys())].ffill()
     
     current_prices = data.iloc[-1]
     quantities = pd.Series(portfolio_positions)
@@ -67,12 +67,22 @@ try:
     cvar_euro = total_actions * cvar_95
     vol_annuelle = portfolio_returns.std() * np.sqrt(252) * 100
     
-    # Calcul du Bêta par rapport au CAC 40
     cac_returns = cac_data.pct_change().dropna()
     aligned = pd.concat([portfolio_returns, cac_returns], axis=1).dropna()
     aligned.columns = ['Portefeuille', 'CAC40']
     cov_matrix = np.cov(aligned['Portefeuille'], aligned['CAC40'])
     beta_portefeuille = cov_matrix[0, 1] / cov_matrix[1, 1]
+    
+    # Calcul des Indicateurs Techniques (RSI 14J, Moyenne Mobile 20J, Perf 5J)
+    delta = data.diff()
+    gain = delta.clip(lower=0).rolling(window=14).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi_14 = (100 - (100 / (1 + rs))).iloc[-1]
+    
+    sma_20 = data.rolling(window=20).mean().iloc[-1]
+    ecart_sma20 = ((current_prices - sma_20) / sma_20) * 100
+    perf_5j = ((current_prices - data.iloc[-6]) / data.iloc[-6]) * 100
     
     # Traduction des tickers en noms d'entreprises
     position_values.index = position_values.index.map(company_names)
@@ -82,6 +92,9 @@ try:
     pnl_euro.index = pnl_euro.index.map(company_names)
     pnl_pct.index = pnl_pct.index.map(company_names)
     returns.columns = returns.columns.map(company_names)
+    rsi_14.index = rsi_14.index.map(company_names)
+    ecart_sma20.index = ecart_sma20.index.map(company_names)
+    perf_5j.index = perf_5j.index.map(company_names)
     
     # --- BANDEAU DE MÉTRIQUES SUPÉRIEUR ---
     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -95,8 +108,9 @@ try:
     st.write("---")
     
     # --- NAVIGATION PAR ONGLETS ---
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "🚨 Conformité, PnL & Capacité d'Achat", 
+        "🎯 Signaux Quantitatifs & Timing",
         "📊 Analyse de Risque & Corrélation", 
         "🛠️ Simulateur d'Ordres (Pre-Trade)"
     ])
@@ -108,7 +122,6 @@ try:
         plafond_15_pct = valeur_totale_portefeuille * 0.15
         marge_achat_euro = np.maximum(0, plafond_15_pct - position_values)
         
-        # Nombre maximal d'actions achetables (limité par le plafond 15% ET le cash disponible)
         budget_max_ligne = np.minimum(marge_achat_euro, liquidites_actuelles)
         actions_max_achetables = np.floor(budget_max_ligne / current_prices)
         
@@ -157,6 +170,57 @@ try:
         )
 
     with tab2:
+        st.write("### Radar de Momentum & Signaux d'Arbitrage sur tes 10 Valeurs")
+        
+        signaux = []
+        for actif in rsi_14.index:
+            r = rsi_14[actif]
+            m = ecart_sma20[actif]
+            p = poids_reels[actif]
+            if p >= 14.0:
+                signaux.append("⚠️ Plafond 15% proche (Bloqué)")
+            elif r < 35:
+                signaux.append("🟢 Survente (Opportunité Rebonds)")
+            elif r > 70:
+                signaux.append("🟠 Surachat (Prise de profit partielle)")
+            elif m > 1.5 and 45 <= r <= 68:
+                signaux.append("🚀 Momentum Haussier (Renforcer)")
+            elif m < -2.0:
+                signaux.append("🔻 Sous Moyenne 20J (Attendre)")
+            else:
+                signaux.append("⚪ Neutre (Conserver)")
+                
+        df_signaux = pd.DataFrame({
+            "Cours Actuel (€)": current_prices,
+            "Perf 5 Jours (%)": perf_5j,
+            "Écart vs MM20 (%)": ecart_sma20,
+            "RSI (14 Jours)": rsi_14,
+            "Poids Actuel (%)": poids_reels,
+            "Signal Tactique": signaux
+        }, index=rsi_14.index).sort_values(by="RSI (14 Jours)", ascending=True)
+        
+        def colorer_rsi(val):
+            if val < 35:
+                return 'color: white; background-color: #006400'
+            elif val > 70:
+                return 'color: black; background-color: #ffa500'
+            return ''
+
+        st.dataframe(
+            df_signaux.style
+            .map(colorer_rsi, subset=['RSI (14 Jours)'])
+            .map(colorer_pnl, subset=['Perf 5 Jours (%)', 'Écart vs MM20 (%)'])
+            .format({
+                "Cours Actuel (€)": "{:.2f} €",
+                "Perf 5 Jours (%)": "{:+.2f} %",
+                "Écart vs MM20 (%)": "{:+.2f} %",
+                "RSI (14 Jours)": "{:.1f}",
+                "Poids Actuel (%)": "{:.2f} %"
+            }),
+            use_container_width=True
+        )
+
+    with tab3:
         col_chart, col_corr = st.columns(2)
         with col_chart:
             st.write("### Contribution au Risque (Volatilité Annuelle par Actif)")
@@ -188,8 +252,8 @@ try:
         base100 = (1 + aligned_6m).cumprod() * 100
         st.line_chart(base100)
 
-    with tab3:
-        st.write("### Testeur d'Ordre Pré-Exécution (Vérification Règle des 15%)")
+    with tab4:
+        st.write("### Testeur d'Ordre Pré-Exécution (Vérification Règle des 15% & Nouveau PRU)")
         col_sim1, col_sim2 = st.columns(2)
         
         with col_sim1:
@@ -199,20 +263,28 @@ try:
             
         with col_sim2:
             prix_unitaire = current_prices[actif_choisi]
+            qte_actuelle = quantities[actif_choisi]
+            pru_actuel = buy_prices[actif_choisi]
             montant_ordre = qte_sim * prix_unitaire
             val_actuelle_ligne = position_values[actif_choisi]
             
             if "Achat" in sens_ordre:
+                nouvelle_qte = qte_actuelle + qte_sim
                 nouvelle_val_ligne = val_actuelle_ligne + montant_ordre
                 nouveau_cash = liquidites_actuelles - montant_ordre
+                nouveau_pru = ((qte_actuelle * pru_actuel) + montant_ordre) / nouvelle_qte
             else:
+                nouvelle_qte = max(0, qte_actuelle - qte_sim)
                 nouvelle_val_ligne = max(0, val_actuelle_ligne - montant_ordre)
                 nouveau_cash = liquidites_actuelles + montant_ordre
+                nouveau_pru = pru_actuel
                 
             nouveau_poids = (nouvelle_val_ligne / valeur_totale_portefeuille) * 100
             
-            st.metric("Montant de l'ordre estimé", f"{montant_ordre:,.2f} €")
-            st.metric("Nouveau Poids de la ligne", f"{nouveau_poids:.2f} %", f"{nouveau_poids - (val_actuelle_ligne/valeur_totale_portefeuille)*100:+.2f} %")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Montant de l'ordre", f"{montant_ordre:,.2f} €")
+            c2.metric("Nouveau Poids", f"{nouveau_poids:.2f} %", f"{nouveau_poids - (val_actuelle_ligne/valeur_totale_portefeuille)*100:+.2f} %")
+            c3.metric("Nouveau PRU Moyen", f"{nouveau_pru:.2f} €", f"{nouvelle_qte:.0f} titres au total", delta_color="off")
             
             if nouveau_cash < 0:
                 st.error(f"❌ Ordre rejeté : Liquidités insuffisantes (Il manque {abs(nouveau_cash):,.2f} €).")
