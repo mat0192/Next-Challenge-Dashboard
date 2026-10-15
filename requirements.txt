@@ -1,3 +1,4 @@
-yfinance
-pandas
-streamlit
+yfinance>=0.2.65,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+streamlit>=1.50,<2

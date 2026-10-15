@@ -1,448 +1,370 @@
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
 
-# optional: try import for normal ppf
+from portfolio_config import INITIAL_CAPITAL, INITIAL_CASH, RULES_URL, RULES_CHECKED, SECTORS, default_holdings, validate_holdings, validate_backup
+from portfolio_math import allocation, market_panels, risk_metrics, max_buy_quantity, simulate_order, wilder_rsi
+
+st.set_page_config(page_title="NextChallenge Solo · Pilotage", page_icon="📊", layout="wide")
+
+
+def euro(value):
+    return f"{value:,.2f} €".replace(",", " ") if np.isfinite(value) else "Non disponible"
+
+
+def number(value, digits=2):
+    return f"{value:.{digits}f}" if np.isfinite(value) else "Non disponible"
+
+
+def display_frame(frame, formats=None):
+    st.dataframe(frame.style.format(formats or {}, na_rep="—"), width="stretch")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_data(tickers):
+    result = yf.download(list(tickers), period="1y", interval="1d", auto_adjust=False,
+                         progress=False, timeout=15, group_by="column")
+    return result, datetime.now(ZoneInfo("Europe/Paris")).isoformat()
+
+
+if "pending_restore" in st.session_state:
+    for key, value in st.session_state.pop("pending_restore").items():
+        st.session_state[key] = value
+if "holdings" not in st.session_state:
+    st.session_state.holdings = default_holdings()
+if "journal" not in st.session_state:
+    st.session_state.journal = []
+
+st.title("NextChallenge Solo")
+st.caption("Comprendre ton portefeuille · Comparer une décision · Préparer le concours")
+with st.sidebar:
+    st.header("Mon compte")
+    capital = st.number_input("Capital de référence (€)", min_value=0.01, value=INITIAL_CAPITAL,
+                              step=100.0, key="capital", help="Apport initial affiché par NextWise : ta capture indique 50 959,17 €.")
+    cash = st.number_input("Liquidités actuelles (€)", min_value=0.0, value=INITIAL_CASH, step=100.0, key="cash")
+    rf_pct = st.number_input("Taux de référence du Sharpe (%/an)", min_value=0.0, max_value=20.0,
+                            value=0.0, step=0.25, key="rf", help="Hypothèse, pas un taux récupéré ni le paramètre officiel du concours. Cash supposé sans rémunération.")
+    if st.button("Actualiser les cours", width="stretch"):
+        load_data.clear()
+    st.caption("Cours Yahoo en cache 5 minutes. Les cours et résultats NextWise font référence pour le concours.")
+    st.caption("Modifications propres à ta session. Exporte ta sauvegarde dans Positions pour les conserver.")
+    st.link_button("Règlement officiel", RULES_URL, width="stretch")
+    st.caption(f"Consulté le {RULES_CHECKED} · Fin annoncée : 9 avril 2027.")
+
+holdings = validate_holdings(st.session_state.holdings).set_index("Code Yahoo")
+names, sectors = holdings["Nom"].to_dict(), holdings["Secteur"].to_dict()
+quantities, buy_prices = holdings["Quantité"], holdings["PRU (€)"]
+tickers = tuple(holdings.index)
+label = lambda ticker: f"{names.get(ticker, ticker)} ({ticker})"
+
 try:
-    from scipy.stats import norm
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
+    with st.spinner("Chargement des cours et de l’historique…"):
+        downloaded, fetched_at = load_data(tickers + ("^FCHI",))
+        prices, quote_dates, adjusted, returns = market_panels(downloaded, tickers)
+    book = allocation(prices, quantities, cash, sectors)
+except Exception as exc:
+    st.error(f"Données indisponibles : {exc}")
+    st.info("Aucune position n’est exclue du total pour masquer un cours manquant. Réessaie avec Actualiser les cours.")
+    # Une mauvaise nouvelle ligne doit rester corrigeable, même sans cours.
+    with st.form("repair_holdings"):
+        repair = st.data_editor(st.session_state.holdings, num_rows="dynamic", width="stretch")
+        if st.form_submit_button("Corriger les positions"):
+            try:
+                st.session_state.holdings = validate_holdings(repair)
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+    st.stop()
 
-st.set_page_config(page_title="Risk Terminal - Front Office", layout="wide")
-st.title("Terminal de Risque & Aide à la Décision 📈")
-st.subheader("Portefeuille Next Challenge — Euronext")
-
-# 1. Inventaire et PRU NextWise
-portfolio_positions = {
-    "S500.PA": 29, "TTE.PA": 50, "ACA.PA": 245, "SAN.PA": 55,
-    "MC.PA": 11, "SAF.PA": 13, "ASML.AS": 3, "AI.PA": 22,
-    "ORA.PA": 280, "STLAP.PA": 980
-}
-
-prix_achat = {
-    "S500.PA": 205.05, "TTE.PA": 79.31, "ACA.PA": 16.31, "SAN.PA": 71.91,
-    "MC.PA": 377.90, "SAF.PA": 318.40, "ASML.AS": 1552.20, "AI.PA": 170.98,
-    "ORA.PA": 13.84, "STLAP.PA": 3.93
-}
-
-company_names = {
-    "S500.PA": "Amundi S&P 500 ETF", "TTE.PA": "TotalEnergies", "ACA.PA": "Crédit Agricole",
-    "SAN.PA": "Sanofi", "MC.PA": "LVMH", "SAF.PA": "Safran",
-    "ASML.AS": "ASML Holding", "AI.PA": "Air Liquide", "ORA.PA": "Orange",
-    "STLAP.PA": "Stellantis"
-}
-
-apport_initial = 50959.17
-liquidites_actuelles = 8662.64
-
-@st.cache_data(ttl=300)
-def load_data():
-    tickers = list(portfolio_positions.keys()) + ["^FCHI"]
-    data = yf.download(tickers, period="1y", progress=False)['Close']
-    return data
-
+now = datetime.now(ZoneInfo("Europe/Paris"))
+quote_age = quote_dates.map(lambda timestamp: (now.date() - pd.Timestamp(timestamp).date()).days)
+stale = quote_age[quote_age > 7]
+total, values, weights = book["total"], book["values"], book["weights"]
+pnl = values - quantities * buy_prices
+performance = total / capital - 1
+metrics = st.columns(4)
+metrics[0].metric("Valorisation estimée", euro(total), f"{performance:+.2%} vs capital de référence",
+                  help="Derniers cours Yahoo + cash saisi. Ce n’est pas la valorisation officielle NextWise.")
+metrics[1].metric("Liquidités", euro(cash), f"{cash / total:.1%} du portefeuille", delta_color="off")
+metrics[2].metric("Valeurs détenues", book["n_lines"], "Minimum solo : 10", delta_color="off")
+metrics[3].metric("Plus grande ligne", f"{weights.max():.2%}", names[weights.idxmax()], delta_color="off")
+st.caption(f"Récupération : {datetime.fromisoformat(fetched_at).strftime('%d/%m/%Y à %H:%M')} (Paris) · "
+           f"Dernières observations : {pd.Timestamp(quote_dates.min()).strftime('%d/%m/%Y')} – {pd.Timestamp(quote_dates.max()).strftime('%d/%m/%Y')}. "
+           "Une barre quotidienne peut être en cours de séance ; aucun cours d’exécution n’est garanti.")
+if len(stale):
+    st.warning("Cours de plus de 7 jours : " + ", ".join(stale.index) + ". Simulations suspendues jusqu’à réception de données récentes.")
 try:
-    raw_data = load_data()
-    cac_data = raw_data["^FCHI"].dropna()
-    data = raw_data[list(portfolio_positions.keys())].ffill()
+    risk = risk_metrics(returns, weights, total, rf_pct / 100)
+except ValueError as exc:
+    risk = None
+    st.warning(f"Analyse de risque indisponible : {exc}")
 
-    current_prices = data.iloc[-1]
-    quantities = pd.Series(portfolio_positions)
-    buy_prices = pd.Series(prix_achat)
+overview, positions_tab, signals_tab, risk_tab, simulation_tab, journal_tab = st.tabs([
+    "🧭 Pilotage", "💼 Positions", "🔎 Signaux", "📊 Risque", "🧪 Simulateur", "📝 Journal & concours"
+])
 
-    # Valorisations et PnL
-    position_values = current_prices * quantities
-    initial_values = buy_prices * quantities
-    pnl_euro = position_values - initial_values
-    pnl_pct = ((current_prices - buy_prices) / buy_prices) * 100
-
-    total_actions = position_values.sum()
-    valeur_totale_portefeuille = total_actions + liquidites_actuelles
-    perf_globale_euro = valeur_totale_portefeuille - apport_initial
-    perf_globale_pct = (perf_globale_euro / apport_initial) * 100
-
-    # Rendements journaliers des actions
-    returns = data.pct_change().dropna()
-
-    # Poids
-    weights_actions = position_values / total_actions
-    weights_total = position_values / valeur_totale_portefeuille  # includes cash implicitly (cash weight = cash/total)
-
-    # Rendements portfolios
-    portfolio_returns_actions = returns.dot(weights_actions)
-    portfolio_returns_total = returns.dot(weights_total)  # cash return = 0 implicitly
-
-    # Historical VaR/CVaR (1-day) on total portfolio (actions + cash)
-    alpha = 0.95
-    q_loss = np.percentile(portfolio_returns_total, 100 * (1 - alpha))
-    hist_var_pct = -q_loss
-    hist_var_euro = hist_var_pct * valeur_totale_portefeuille
-
-    cvar_mask = portfolio_returns_total <= q_loss
-    if cvar_mask.sum() > 0:
-        hist_cvar_pct = -portfolio_returns_total[cvar_mask].mean()
+with overview:
+    st.subheader("À vérifier avant de décider")
+    if book["violations"]:
+        for violation in book["violations"]:
+            st.warning(violation)
     else:
-        hist_cvar_pct = 0.0
-    hist_cvar_euro = hist_cvar_pct * valeur_totale_portefeuille
+        st.success("Les trois repères solo sont respectés avec les données et secteurs saisis.")
+    if book["n_lines"] == 10:
+        st.info("Tu détiens exactement 10 valeurs : solder une ligne ferait passer ce nombre à 9. Compare l’ensemble de la réallocation avant de valider tes ordres.")
+    if weights.max() >= 0.13:
+        st.info(f"{names[weights.idxmax()]} approche du plafond : {weights.max():.2%}. Une hausse du cours peut aussi augmenter ce poids.")
+    st.caption("Secteurs indicatifs à rapprocher de NextWise ; l’ETF diversifié n’ajoute pas un secteur au compteur. Le classement officiel n’est pas recalculé ici.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Secteurs identifiés", book["n_sectors"], "Minimum solo : 4", delta_color="off")
+    c2.metric("HHI des titres", number(book["hhi"] * 10000, digits=0),
+              help="Somme des poids au carré, normalisés sur les titres, × 10 000. Dix lignes égales = 1 000. Cash exclu ; la convention officielle peut différer.")
+    c3.metric("Nombre effectif de lignes", number(book["effective_lines"], digits=1),
+              help="Inverse de la somme des poids normalisés au carré. Mesure la concentration par ligne, sans détailler les constituants de l’ETF.")
+    if risk:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Volatilité annualisée estimée", f"{risk['vol']:.2%}", help="Variabilité de l’allocation constante sur l’historique disponible, cash inclus.")
+        c2.metric("Perte moyenne en queue · CVaR 95 %", euro(risk["hist_es"]), help="Moyenne des pertes de la queue historique défavorable. Ce n’est pas une perte maximale.")
+        c3.metric("Ratio de diversification", number(risk["diversification"]), help="Moyenne pondérée des volatilités individuelles / volatilité du portefeuille.")
+        largest = risk["es_components"].idxmax()
+        st.write(f"**À examiner :** {names[largest]} contribue le plus à la perte moyenne de queue simulée ({euro(risk['es_components'][largest])}). Ce classement ne prédit pas la prochaine baisse.")
+    left, right = st.columns(2)
+    with left:
+        st.write("**Répartition par ligne (% du total)**")
+        allocation_chart = (weights * 100).rename(index=label)
+        allocation_chart.loc["Liquidités"] = cash / total * 100
+        st.bar_chart(allocation_chart.sort_values(ascending=False))
+    with right:
+        st.write("**Répartition par secteur (% du total)**")
+        st.bar_chart(book["sector_weights"] * 100)
+        st.caption("ETF affiché séparément : pas de détail de ses constituants ni de leur recouvrement avec tes actions.")
+    with st.expander("Comment utiliser cette page"):
+        st.write("1. Vérifie positions et cash. 2. Repère les concentrations. 3. Compare l’ordre dans le simulateur. 4. Écris ta thèse et ce qui te ferait changer d’avis.")
+        st.write("Une faible VaR, un Sharpe élevé ou davantage de lignes ne suffisent pas à sélectionner un investissement. Ces repères rendent les compromis visibles.")
 
-    # Parametric VaR (variance-covariance) using normal assumption
-    mu_assets = returns.mean()
-    mu_portfolio = portfolio_returns_total.mean()
-    Sigma = returns.cov()  # daily covariance
+with positions_tab:
+    st.subheader("Positions & capacité d’achat")
+    max_qty = pd.Series({t: max_buy_quantity(prices, quantities, cash, t) for t in tickers})
+    follow = pd.DataFrame({"Valeur": [names[t] for t in tickers], "Secteur": [sectors[t] for t in tickers],
+                           "Quantité": quantities, "PRU (€)": buy_prices, "Cours Yahoo (€)": prices,
+                           "Capital (€)": values, "PnL latent (€)": pnl,
+                           "Poids (%)": weights * 100, "Achat max (titres)": max_qty,
+                           "Date cours": quote_dates.map(lambda d: pd.Timestamp(d).strftime('%d/%m/%Y'))})
+    display_frame(follow.sort_values("Poids (%)", ascending=False), {"Quantité": "{:.0f}", "PRU (€)": "{:.2f}",
+                  "Cours Yahoo (€)": "{:.2f}", "Capital (€)": "{:,.2f}", "PnL latent (€)": "{:+,.2f}",
+                  "Poids (%)": "{:.2f}", "Achat max (titres)": "{:.0f}"})
+    st.caption("Achat max : cash et plafond de 15 % pour cette seule ligne. Ces capacités ne s’additionnent pas : chaque achat utilise le même cash. PnL latent hors gains/pertes réalisés.")
+    with st.expander("Mettre à jour les quantités, PRU et valeurs"):
+        st.write("Reporte tes positions après exécution sur NextWise. Modifications limitées à cette session.")
+        with st.form("edit_holdings"):
+            edited = st.data_editor(st.session_state.holdings, num_rows="dynamic", hide_index=True,
+                                    column_config={"Secteur": st.column_config.SelectboxColumn(options=SECTORS, required=True),
+                                                   "Quantité": st.column_config.NumberColumn(min_value=0, step=1, required=True),
+                                                   "PRU (€)": st.column_config.NumberColumn(min_value=0, required=True)}, width="stretch")
+            apply_changes = st.form_submit_button("Appliquer à cette session")
+        if apply_changes:
+            try:
+                st.session_state.holdings = validate_holdings(edited)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+        st.caption("Vérifie l’éligibilité NextWise, la devise EUR et le secteur des nouvelles valeurs. Les lignes à quantité nulle restent disponibles à la simulation.")
+    snapshot = dict(version=1, capital=float(capital), cash=float(cash), rf=float(rf_pct),
+                    holdings=st.session_state.holdings.to_dict(orient="records"), journal=st.session_state.journal)
+    st.download_button("Exporter ma sauvegarde (positions + journal)", json.dumps(snapshot, ensure_ascii=False, indent=2),
+                       file_name="nextchallenge_sauvegarde.json", mime="application/json")
+    imported = st.file_uploader("Restaurer une sauvegarde du dashboard", type=["json"])
+    if imported is not None and st.button("Restaurer dans cette session"):
+        try:
+            if imported.size > 2_000_000:
+                raise ValueError("Fichier trop volumineux (maximum 2 Mo).")
+            st.session_state.pending_restore = validate_backup(json.loads(imported.getvalue()))
+            st.rerun()
+        except (ValueError, KeyError, TypeError) as exc:
+            st.error(f"Sauvegarde non chargée : {exc}")
 
-    # portfolio daily std (including cash as zero-return)
-    w = weights_total.values
-    Sigma_mat = Sigma.values
-    port_var_daily = float(w @ Sigma_mat @ w)
-    port_std_daily = np.sqrt(port_var_daily)
-    # annualize
-    port_std_annual = port_std_daily * np.sqrt(252)
+with signals_tab:
+    st.subheader("Lecture technique · constats, pas ordres d’achat")
+    rsi = wilder_rsi(adjusted).iloc[-1]
+    latest = adjusted.iloc[-1]
+    sma20 = adjusted.rolling(20).mean().iloc[-1]
+    sma50 = adjusted.rolling(50).mean().iloc[-1]
+    sma200 = adjusted.rolling(200).mean().iloc[-1]
+    perf5 = adjusted.pct_change(5, fill_method=None).iloc[-1] * 100
+    perf20 = adjusted.pct_change(20, fill_method=None).iloc[-1] * 100
+    readings = []
+    for ticker in tickers:
+        if not np.isfinite(rsi[ticker]):
+            reading = "Historique insuffisant"
+        elif rsi[ticker] < 35:
+            reading = "RSI bas : faiblesse récente, rebond non confirmé"
+        elif rsi[ticker] > 70:
+            reading = "RSI élevé : hausse soutenue, repli possible"
+        else:
+            reading = "RSI intermédiaire : pas de conclusion isolée"
+        readings.append(reading)
+    signal_frame = pd.DataFrame({"Valeur": [names[t] for t in tickers], "RSI 14J": rsi,
+                                "Perf. 5 séances (%)": perf5, "Perf. 20 séances (%)": perf20,
+                                "Écart MM20 (%)": (latest / sma20 - 1) * 100,
+                                "Écart MM50 (%)": (latest / sma50 - 1) * 100,
+                                "Écart MM200 (%)": (latest / sma200 - 1) * 100,
+                                "Lecture": readings})
+    display_frame(signal_frame, {c: "{:+.2f}" for c in signal_frame if c not in ["Valeur", "Lecture"]})
+    st.info("Confronte le mouvement aux informations d’entreprise, au calendrier des résultats et à ta thèse. Une survente peut durer ; une tendance forte peut rester en surachat.")
+    st.caption("Cours ajustés ; RSI de Wilder amorcé par une moyenne simple sur 14 variations. Un historique manquant ne devient pas un signal de survente.")
 
-    # get z for alpha
-    if _HAS_SCIPY:
-        z = -norm.ppf(1 - alpha)
+with risk_tab:
+    st.subheader("Risque de l’allocation actuelle")
+    st.info("Simulation historique à poids constants, cash inclus à rendement nul. Les graphiques et le Sharpe ci-dessous ne sont ni ton historique réel de transactions ni ton score NextWise.")
+    if risk is None:
+        st.write("Ces indicateurs nécessitent un historique commun suffisant.")
     else:
-        # fallback approximate for 95%
-        z = 1.6448536269514722 if alpha == 0.95 else 2.3263478740408408
-
-    # parametric VaR pct (positive number)
-    param_var_pct = -(mu_portfolio + (-z) * port_std_daily)
-    # since z above is positive, use more stable formula: -(mu + z * std)
-    param_var_pct = -(mu_portfolio + (-z) * port_std_daily) if False else -(mu_portfolio - z * port_std_daily)
-    # Correct formula: VaR = -(mu_portfolio + z_alpha * port_std_daily) where z_alpha is negative quantile
-    # Using z_pos = -norm.ppf(1-alpha) so z_pos>0, VaR_pct = -(mu_portfolio - z_pos * port_std_daily)
-    z_pos = z
-    param_var_pct = -(mu_portfolio - z_pos * port_std_daily)
-    param_var_euro = param_var_pct * valeur_totale_portefeuille
-
-    # Parametric CVaR (Gaussian) approximation: cvar = -(mu - (pdf(z)/(1-alpha)) * std) where z = norm.ppf(1-alpha)
-    if _HAS_SCIPY:
-        z_q = norm.ppf(1 - alpha)
-        pdf_z = norm.pdf(z_q)
-        param_cvar_pct = -(mu_portfolio + (pdf_z / (1 - alpha)) * port_std_daily)
-    else:
-        # fallback: approximate parametric CVaR with historical CVaR
-        param_cvar_pct = hist_cvar_pct
-    param_cvar_euro = param_cvar_pct * valeur_totale_portefeuille
-
-    # Vol annualisée (total portfolio)
-    vol_annuelle = port_std_daily * np.sqrt(252) * 100
-
-    # Beta vs CAC40 (use portfolio of actions only)
-    cac_returns = cac_data.pct_change().dropna()
-    aligned = pd.concat([portfolio_returns_actions, cac_returns], axis=1).dropna()
-    aligned.columns = ['Portefeuille', 'CAC40']
-    cov_matrix = np.cov(aligned['Portefeuille'], aligned['CAC40'])
-    beta_portefeuille = cov_matrix[0, 1] / cov_matrix[1, 1]
-
-    # RSI (Wilder) 14J
-    delta = data.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    period = 14
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.fillna(0)
-    rsi[(avg_loss == 0) & (avg_gain > 0)] = 100
-    rsi[(avg_loss == 0) & (avg_gain == 0)] = 50
-    rsi_14 = rsi.iloc[-1]
-
-    sma_20 = data.rolling(window=20).mean().iloc[-1]
-    ecart_sma20 = ((current_prices - sma_20) / sma_20) * 100
-    perf_5j = ((current_prices - data.iloc[-6]) / data.iloc[-6]) * 100
-
-    # Risk decomposition: parametric marginal contributions (Euler) and historical contributions
-    # Parametric marginal contribution (pct): MC_i = -(w_i * mu_i + z_pos * (Sigma@w)_i / port_std_daily)
-    mu_i = mu_assets
-    Sigma_w = Sigma_mat @ w
-    # avoid divide by zero
-    if port_std_daily == 0:
-        mc_param_pct = np.zeros_like(w)
-    else:
-        mc_param_pct = -(w * mu_i.values + z_pos * (Sigma_w / port_std_daily))
-    mc_param_euro = mc_param_pct * valeur_totale_portefeuille
-
-    # Historical marginal contributions via tail average
-    tail_idx = portfolio_returns_total <= q_loss
-    if tail_idx.sum() > 0:
-        contribs_assets = returns[tail_idx].multiply(weights_total, axis=1)
-        hist_mc_pct = -contribs_assets.mean().values  # positive contributions to loss
-    else:
-        hist_mc_pct = np.zeros(len(w))
-    hist_mc_euro = hist_mc_pct * valeur_totale_portefeuille
-
-    # Volatility contributions (variance decomposition)
-    # variance contribution daily: w_i * (Sigma@w)_i
-    var_contrib_daily = w * Sigma_w
-    total_var_daily = port_var_daily if port_var_daily > 0 else 1.0
-    share_var = var_contrib_daily / total_var_daily
-    # contribution in euros approximated as share_var * portfolio annual std * portfolio value
-    contrib_vol_euro = share_var * (port_std_daily * np.sqrt(252)) * valeur_totale_portefeuille
-
-    # Prepare display series with company names
-    assets = list(company_names.values())
-    mc_param_ser = pd.Series(mc_param_euro, index=assets)
-    hist_mc_ser = pd.Series(hist_mc_euro, index=assets)
-    contrib_vol_ser = pd.Series(contrib_vol_euro, index=assets)
-    weights_ser = (weights_total * 100).rename(index=company_names)
-    vol_indiv = (returns.std() * np.sqrt(252) * 100).rename(index=company_names)
-
-    # --- BANDEAU DE MÉTRIQUES SUPÉRIEUR ---
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Valorisation Totale", f"{valeur_totale_portefeuille:,.2f} €", f"{perf_globale_pct:.2f} % ({perf_globale_euro:+.2f} €)")
-    col2.metric("Titres Investis", f"{total_actions:,.2f} €", f"{(total_actions/valeur_totale_portefeuille)*100:.1f} % du total")
-    col3.metric("Cash Disponible", f"{liquidites_actuelles:,.2f} €", f"{(liquidites_actuelles/valeur_totale_portefeuille)*100:.1f} % du total")
-    col4.metric("VaR Hist. (95%) 1J", f"{hist_var_euro:,.0f} €", f"{hist_var_pct*100:.2f} %", delta_color="inverse")
-    col5.metric("VaR Param. (95%) 1J", f"{param_var_euro:,.0f} €", f"{param_var_pct*100:.2f} %", delta_color="inverse")
-    col6.metric("CVaR Hist. (5%) 1J", f"{hist_cvar_euro:,.0f} €", f"{hist_cvar_pct*100:.2f} %", delta_color="inverse")
-
-    st.write("---")
-
-    # --- NAVIGATION PAR ONGLETS ---
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🚨 Conformité, PnL & Capacité d'Achat",
-        "🎯 Signaux Quantitatifs & Timing",
-        "📊 Analyse de Risque & Corrélation",
-        "🛠️ Simulateur d'Ordres (Pre-Trade)",
-        "📉 Stress & Décomposition du Risque"
-    ])
-
-    with tab1:
-        st.write("### Suivi des Positions & Limite Réglementaire (Max 15%)")
-
-        poids_reels = (position_values / valeur_totale_portefeuille) * 100
-        plafond_15_pct = valeur_totale_portefeuille * 0.15
-        marge_achat_euro = np.maximum(0, plafond_15_pct - position_values)
-
-        budget_max_ligne = np.minimum(marge_achat_euro, liquidites_actuelles)
-        actions_max_achetables = np.floor(budget_max_ligne / current_prices)
-
-        df_suivi = pd.DataFrame({
-            "Quantité": quantities,
-            "PRU (€)": buy_prices,
-            "Cours Actuel (€)": current_prices,
-            "Capital Actuel (€)": position_values,
-            "PnL (€)": pnl_euro,
-            "PnL (%)": pnl_pct,
-            "Poids (%)": poids_reels,
-            "Marge avant 15% (€)": marge_achat_euro,
-            "Actions Achetables Max": actions_max_achetables
-        }).sort_values(by="Poids (%)", ascending=False)
-
-        def colorer_limites(val):
-            if val >= 15:
-                return 'color: white; background-color: darkred'
-            elif val >= 13:
-                return 'color: black; background-color: orange'
-            return 'color: white; background-color: darkgreen'
-
-        def colorer_pnl(val):
-            if val > 0:
-                return 'color: #00ff88'
-            elif val < 0:
-                return 'color: #ff4b4b'
-            return ''
-
-        st.dataframe(
-            df_suivi.style
-            .map(colorer_limites, subset=['Poids (%)'])
-            .map(colorer_pnl, subset=['PnL (€)', 'PnL (%)'])
-            .format({
-                "Quantité": "{:.0f}",
-                "PRU (€)": "{:.2f} €",
-                "Cours Actuel (€)": "{:.2f} €",
-                "Capital Actuel (€)": "{:,.2f} €",
-                "PnL (€)": "{:+.2f} €",
-                "PnL (%)": "{:+.2f} %",
-                "Poids (%)": "{:.2f} %",
-                "Marge avant 15% (€)": "{:,.2f} €",
-                "Actions Achetables Max": "+{:.0f} titres"
-            }),
-            use_container_width=True
-        )
-
-    with tab2:
-        st.write("### Radar de Momentum & Signaux d'Arbitrage sur tes 10 Valeurs")
-
-        signaux = []
-        for actif in rsi_14.index:
-            r = rsi_14[actif]
-            m = ecart_sma20[actif]
-            p = poids_reels[actif]
-            if p >= 14.0:
-                signaux.append("⚠️ Plafond 15% proche (Bloqué)")
-            elif r < 35:
-                signaux.append("🟢 Survente (Opportunité Rebonds)")
-            elif r > 70:
-                signaux.append("🟠 Surachat (Prise de profit partielle)")
-            elif m > 1.5 and 45 <= r <= 68:
-                signaux.append("🚀 Momentum Haussier (Renforcer)")
-            elif m < -2.0:
-                signaux.append("🔻 Sous Moyenne 20J (Attendre)")
-            else:
-                signaux.append("⚪ Neutre (Conserver)")
-
-        df_signaux = pd.DataFrame({
-            "Cours Actuel (€)": current_prices,
-            "Perf 5 Jours (%)": perf_5j,
-            "Écart vs MM20 (%)": ecart_sma20,
-            "RSI (14 Jours)": rsi_14,
-            "Poids Actuel (%)": poids_reels,
-            "Signal Tactique": signaux
-        }, index=rsi_14.index).sort_values(by="RSI (14 Jours)", ascending=True)
-
-        def colorer_rsi(val):
-            if val < 35:
-                return 'color: white; background-color: #006400'
-            elif val > 70:
-                return 'color: black; background-color: #ffa500'
-            return ''
-
-        st.dataframe(
-            df_signaux.style
-            .map(colorer_rsi, subset=['RSI (14 Jours)'])
-            .map(colorer_pnl, subset=['Perf 5 Jours (%)', 'Écart vs MM20 (%)'])
-            .format({
-                "Cours Actuel (€)": "{:.2f} €",
-                "Perf 5 Jours (%)": "{:+.2f} %",
-                "Écart vs MM20 (%)": "{:+.2f} %",
-                "RSI (14 Jours)": "{:.1f}",
-                "Poids Actuel (%)": "{:.2f} %"
-            }),
-            use_container_width=True
-        )
-
-    with tab3:
-        col_chart, col_corr = st.columns(2)
-        with col_chart:
-            st.write("### Contribution au Risque (Volatilité Annuelle par Actif)")
-            st.bar_chart(vol_indiv)
-
-        with col_corr:
-            st.write("### Matrice de Corrélation Thermique (1 an)")
-            corr_matrix = returns.corr()
-
-            def colorer_corr(val):
-                if val >= 0.99:
-                    return 'color: #888888; background-color: #1e1e1e'
-                elif val >= 0.45:
-                    return 'color: white; background-color: #8b0000'
-                elif val >= 0.25:
-                    return 'color: white; background-color: #b22222'
-                elif val <= -0.15:
-                    return 'color: white; background-color: #0047ab'
-                return ''
-
-            st.dataframe(
-                corr_matrix.style.map(colorer_corr).format("{:.2f}"),
-                use_container_width=True
-            )
-
-        st.write("### Trajectoire Comparée sur 6 Mois : Ton Allocation vs CAC 40 (Base 100)")
-        aligned_6m = aligned.tail(126)
-        base100 = (1 + aligned_6m).cumprod() * 100
-        st.line_chart(base100)
-
-    with tab4:
-        st.write("### Testeur d'Ordre Pré-Exécution (Vérification Règle des 15% & Nouveau PRU)")
-        col_sim1, col_sim2 = st.columns(2)
-
-        with col_sim1:
-            actif_choisi = st.selectbox(
-                "Choisis la ligne à renforcer ou alléger :",
-                list(portfolio_positions.keys()),
-                format_func=lambda ticker: company_names.get(ticker, ticker)
-            )
-            sens_ordre = st.radio("Sens de l'opération :", ["Achat (Renforcement)", "Vente (Allègement)"], horizontal=True)
-            qte_sim = st.number_input("Quantité de titres à traiter :", min_value=1, value=10, step=1)
-
-        with col_sim2:
-            prix_unitaire = current_prices[actif_choisi]
-            qte_actuelle = quantities[actif_choisi]
-            pru_actuel = buy_prices[actif_choisi]
-            montant_ordre = qte_sim * prix_unitaire
-            val_actuelle_ligne = position_values[actif_choisi]
-
-            if "Achat" in sens_ordre:
-                nouvelle_qte = qte_actuelle + qte_sim
-                nouvelle_val_ligne = val_actuelle_ligne + montant_ordre
-                nouveau_cash = liquidites_actuelles - montant_ordre
-                if nouvelle_qte > 0:
-                    nouveau_pru = ((qte_actuelle * pru_actuel) + montant_ordre) / nouvelle_qte
-                else:
-                    nouveau_pru = pru_actuel
-            else:
-                nouvelle_qte = max(0, qte_actuelle - qte_sim)
-                nouvelle_val_ligne = max(0, val_actuelle_ligne - montant_ordre)
-                nouveau_cash = liquidites_actuelles + montant_ordre
-                nouveau_pru = pru_actuel
-
-            nouvelle_valeur_portefeuille = valeur_totale_portefeuille + (nouvelle_val_ligne - val_actuelle_ligne) - (liquidites_actuelles - nouveau_cash)
-            if nouvelle_valeur_portefeuille == 0:
-                nouveau_poids = 0.0
-            else:
-                nouveau_poids = (nouvelle_val_ligne / nouvelle_valeur_portefeuille) * 100
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Montant de l'ordre", f"{montant_ordre:,.2f} €")
-            c2.metric("Nouveau Poids", f"{nouveau_poids:.2f} %", f"{nouveau_poids - (val_actuelle_ligne/valeur_totale_portefeuille)*100:+.2f} %")
-            c3.metric("Nouveau PRU Moyen", f"{nouveau_pru:.2f} €", f"{nouvelle_qte:.0f} titres au total", delta_color="off")
-
-            if nouveau_cash < 0:
-                st.error(f"❌ Ordre rejeté : Liquidités insuffisantes (Il manque {abs(nouveau_cash):,.2f} €).")
-            elif nouveau_poids > 15.0:
-                st.error(f"🚨 ALERTE CONFORMITÉ : Cet achat fait passer {company_names.get(actif_choisi, actif_choisi)} à {nouveau_poids:.2f} % (Plafond autorisé : 15,00 %).")
-            else:
-                st.success(f"✅ Ordre valide ! Nouveau solde espèces après exécution : {nouveau_cash:,.2f} €.")
-
-    with tab5:
-        st.write("### Stress Tests & Décomposition du Risque")
-        st.write("Scénarios simples (impact direct sur cours des actions)")
-        shocks = st.slider("Choisis un choc de marché (uniform pour tous les titres) :", -50, 0, -10, step=5)
-        shocks_pct = shocks / 100.0
-
-        # Scenario impact
-        shocked_values = position_values * (1 + shocks_pct)
-        impact_euro = position_values.sum() - shocked_values.sum()
-        impact_pct = (impact_euro / valeur_totale_portefeuille) * 100
-        st.metric(f"Impact du choc {shocks}% sur la valeur", f"-{impact_euro:,.2f} €", f"-{impact_pct:.2f} %")
-
-        st.write("---")
-        st.write("### Décomposition du risque (contributions à la VaR)")
-        df_contrib = pd.DataFrame({
-            "Poids (%)": weights_ser,
-            "Vol. Ann. (%)": vol_indiv,
-            "Contrib VaR Param (€)": mc_param_ser,
-            "Contrib VaR Hist (€)": hist_mc_ser,
-            "Contrib Vol (€ approx.)": contrib_vol_ser
-        })
-        df_contrib = df_contrib.sort_values(by="Contrib VaR Param (€)", ascending=False)
-        st.dataframe(df_contrib.style.format({
-            "Poids (%)": "{:.2f} %",
-            "Vol. Ann. (%)": "{:.2f} %",
-            "Contrib VaR Param (€)": "{:,.0f} €",
-            "Contrib VaR Hist (€)": "{:,.0f} €",
-            "Contrib Vol (€ approx.)": "{:,.0f} €"
-        }), use_container_width=True)
-
-        st.write("### Graphique : Contributions à la VaR (paramétrique vs historique)")
+        st.caption(f"{risk['n']} rendements communs · {risk['tail_n']} observations dans la queue à 5 % · {returns.index.min().date()} – {returns.index.max().date()}.")
+        if risk["n"] < 100:
+            st.warning("Échantillon court : mesures de queue particulièrement instables.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("VaR historique · 95 % · 1 séance", euro(risk["hist_var"]))
+        c2.metric("CVaR historique · 95 % · 1 séance", euro(risk["hist_es"]))
+        c3.metric("VaR normale · 95 % · 1 séance", euro(risk["param_var"]))
+        c4.metric("CVaR normale · 95 % · 1 séance", euro(risk["param_es"]))
         c1, c2 = st.columns(2)
-        with c1:
-            st.bar_chart(mc_param_ser.sort_values(ascending=False))
-        with c2:
-            st.bar_chart(hist_mc_ser.sort_values(ascending=False))
+        c1.metric("Sharpe de l’allocation simulée", number(risk["sharpe"]), help="Excès de rendement journalier / volatilité × √252. Le taux de référence est paramétrable à gauche.")
+        c2.metric("Repli maximal simulé", f"{risk['max_drawdown']:.2%}", help="Plus forte baisse depuis un sommet, capital initial inclus.")
+        with st.expander("VaR, CVaR et Sharpe en langage simple"):
+            st.write("La VaR à 95 % est un seuil de perte dépassé dans les 5 % de scénarios les plus défavorables du modèle. La CVaR est la perte moyenne de cette queue. Aucune n’est une perte maximale.")
+            st.write("La méthode historique reprend les observations passées. La méthode normale suppose une distribution gaussienne et peut sous-estimer les extrêmes. Le Sharpe rapporte l’excès de rendement à la volatilité ; son niveau passé ne garantit rien pour la suite.")
+            st.write("Quantiles conservés avec leur signe : une estimation négative correspond à un gain à ce quantile. Les conventions de calcul ici ne reproduisent pas nécessairement celles de NextWise.")
+        contrib = pd.DataFrame({"Poids (%)": weights * 100, "Vol. individuelle (%/an)": risk["individual_vol"] * 100,
+                                "Contribution VaR normale (€)": risk["var_components"],
+                                "Contribution CVaR historique (€)": risk["es_components"],
+                                "Part de variance (%)": risk["vol_shares"] * 100}).rename(index=label)
+        st.write("**Quelle ligne contribue au risque du portefeuille ?**")
+        display_frame(contrib.sort_values("Contribution CVaR historique (€)", ascending=False), "{:.2f}")
+        st.caption("Les contributions totalisent leur mesure respective. Une contribution négative traduit une compensation dans cet échantillon. La volatilité individuelle seule n’est pas une contribution au risque.")
+        st.bar_chart(contrib[["Contribution VaR normale (€)", "Contribution CVaR historique (€)"]])
+        left, right = st.columns(2)
+        with left:
+            st.write("**Trajectoire simulée, base 100**")
+            chart = pd.DataFrame({"Allocation actuelle + cash": risk["wealth"] * 100})
+            benchmark = None
+            if "^FCHI" in downloaded["Close"]:
+                benchmark = downloaded["Close"]["^FCHI"].pct_change(fill_method=None).reindex(chart.index)
+                if benchmark.notna().all():
+                    chart["CAC 40 prix (hors dividendes)"] = (1 + benchmark).cumprod() * 100
+            chart.loc[chart.index[0] - pd.offsets.BDay(1)] = 100
+            st.line_chart(chart.sort_index())
+            st.caption("Comparaison illustrative : allocation ajustée des dividendes face au CAC 40 prix. Ne mesure pas une surperformance homogène. Poids rééquilibrés chaque séance, sans frais.")
+            if benchmark is not None:
+                pair = pd.concat([risk["returns"].rename("portfolio"), benchmark.rename("benchmark")], axis=1).dropna()
+                if len(pair) >= 20 and pair["benchmark"].var() > 0:
+                    beta = pair.cov().loc["portfolio", "benchmark"] / pair["benchmark"].var()
+                    st.caption(f"Bêta vs CAC 40 : {beta:.2f}, cash inclus. Sensibilité historique, pas une prévision.")
+        with right:
+            st.write("**Replis depuis un sommet (%)**")
+            st.area_chart(risk["drawdown"] * 100)
+        with st.expander("Corrélations et recouvrements"):
+            display_frame(returns.corr().rename(index=label, columns=label), "{:.2f}")
+            pairs = [(a, b, returns[a].corr(returns[b])) for i, a in enumerate(tickers) for b in tickers[i + 1:] if quantities[a] > 0 and quantities[b] > 0]
+            high = sorted([p for p in pairs if np.isfinite(p[2]) and p[2] >= 0.75], key=lambda x: -x[2])[:5]
+            for a, b, corr in high:
+                st.write(f"{names[a]} / {names[b]} : {corr:.2f}. Vérifie si ces lignes apportent des expositions différentes.")
+            if not high:
+                st.write("Aucune paire détenue au-dessus de 0,75. Les corrélations peuvent changer en période de stress.")
+    st.write("**Stress déterministe**")
+    shock = st.slider("Baisse hypothétique de tous les titres (%)", -50, 0, -10, step=1)
+    impact = book["invested"] * shock / 100
+    c1, c2 = st.columns(2)
+    c1.metric("Impact du scénario", euro(impact), f"{impact / total:.2%}", delta_color="off")
+    c2.metric("Valeur après ce scénario", euro(total + impact))
+    st.caption("Même choc sur chaque titre ; cash inchangé. Aucune probabilité n’est associée à ce scénario.")
 
-        st.write("---")
-        st.write("### Détails supplémentaires : Parametric vs Historical VaR/CVaR")
-        st.write(f"VaR historique (95%) : {hist_var_euro:,.2f} € ({hist_var_pct*100:.2f} %)")
-        st.write(f"CVaR historique (5%) : {hist_cvar_euro:,.2f} € ({hist_cvar_pct*100:.2f} %)")
-        st.write(f"VaR paramétrique (95%) : {param_var_euro:,.2f} € ({param_var_pct*100:.2f} %)")
-        st.write(f"CVaR paramétrique (5%) : {param_cvar_euro:,.2f} € ({param_cvar_pct*100:.2f} %)")
+with simulation_tab:
+    st.subheader("Comparer un ordre avant de le saisir sur NextWise")
+    st.caption("Simulation uniquement, sans transmission d’ordre. Frais nuls selon l’article 4 ; cours d’exécution à vérifier sur NextWise.")
+    left, right = st.columns([1, 2])
+    with left:
+        chosen = st.selectbox("Valeur à simuler", list(tickers), format_func=label, key="sim_asset")
+        side = st.radio("Sens", ["Achat", "Vente"], horizontal=True, key="sim_side")
+        quantity = st.number_input("Quantité à simuler", min_value=1, value=1, step=1, key="sim_quantity")
+        execution = st.number_input("Cours de simulation (€)", min_value=0.0001, value=float(prices[chosen]),
+                                    step=0.01, format="%.4f", key=f"execution_{chosen}")
+        local_prices = prices.copy()
+        local_prices[chosen] = execution
+        st.write(f"Titres détenus : **{quantities[chosen]:.0f}**")
+        st.write(f"Achat max cash / 15 % : **{max_buy_quantity(local_prices, quantities, cash, chosen)} titres**")
+        st.caption("Le cours saisi valorise cette ligne avant et après l’ordre. Le capital reste identique avant/après, hors changement d’hypothèse de cours.")
+    with right:
+        if len(stale):
+            st.warning("Simulation suspendue : cours trop ancien. Actualise les données.")
+        else:
+            try:
+                result = simulate_order(prices, quantities, buy_prices, cash, chosen, side, quantity, execution, sectors)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                before, after = result["before"], result["after"]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Montant simulé", euro(result["amount"]))
+                c2.metric("Cash après", euro(result["cash"]))
+                c3.metric("PRU après", euro(result["pru"]))
+                comparison = pd.DataFrame({"Avant": [before["weights"][chosen] * 100, before["n_lines"], before["n_sectors"], before["hhi"] * 10000],
+                                           "Après": [after["weights"][chosen] * 100, after["n_lines"], after["n_sectors"], after["hhi"] * 10000]},
+                                          index=["Poids de la ligne (%)", "Valeurs détenues", "Secteurs identifiés", "HHI titres"])
+                if risk is not None:
+                    risk_before = risk_metrics(returns, before["weights"], before["total"], rf_pct / 100)
+                    risk_after = risk_metrics(returns, after["weights"], after["total"], rf_pct / 100)
+                    for title, key, factor in [("Volatilité (%/an)", "vol", 100), ("VaR historique 95 % (€)", "hist_var", 1),
+                                               ("CVaR historique 95 % (€)", "hist_es", 1), ("Ratio de diversification", "diversification", 1)]:
+                        comparison.loc[title] = [risk_before[key] * factor, risk_after[key] * factor]
+                comparison["Variation"] = comparison["Après"] - comparison["Avant"]
+                display_frame(comparison, {"Avant": "{:.2f}", "Après": "{:.2f}", "Variation": "{:+.2f}"})
+                if after["violations"]:
+                    for violation in after["violations"]:
+                        st.warning(violation)
+                else:
+                    st.success("Les trois repères solo restent respectés après simulation, selon les données saisies.")
+                st.caption("Un risque estimé plus faible ne prouve pas que le rendement ou le classement s’améliorera. Confronte aussi l’ordre à ta thèse et aux données NextWise.")
 
-except Exception as e:
-    st.error(f"Erreur serveur : {e}")
-
+with journal_tab:
+    st.subheader("Préparer une décision que tu peux expliquer")
+    st.caption("Notes personnelles de session, exportables. Aucune publication ou interaction automatique sur NextWise.")
+    with st.form("decision_journal", clear_on_submit=True):
+        journal_asset = st.selectbox("Valeur étudiée", list(tickers), format_func=label)
+        journal_action = st.selectbox("Décision envisagée", ["Observer", "Conserver", "Acheter / renforcer", "Vendre / alléger"])
+        thesis = st.text_area("Thèse : pourquoi cette décision ?", max_chars=3000)
+        catalyst = st.text_input("Catalyseur et horizon", max_chars=500)
+        invalidation = st.text_area("Qu’est-ce qui invaliderait ma thèse ?", max_chars=1500)
+        sources = st.text_area("Sources consultées et dates", placeholder="Résultats, communiqué, document d’entreprise…", max_chars=2000)
+        ai_note = st.text_input("Aide IA utilisée, le cas échéant", max_chars=500)
+        if st.form_submit_button("Ajouter à mon journal"):
+            if not thesis.strip() or not invalidation.strip() or not sources.strip():
+                st.warning("Complète la thèse, son invalidation et les sources.")
+            else:
+                st.session_state.journal.append({"Date": now.isoformat(timespec="minutes"), "Valeur": label(journal_asset),
+                                                 "Décision": journal_action, "Thèse": thesis, "Catalyseur / horizon": catalyst,
+                                                 "Invalidation": invalidation, "Sources": sources, "Aide IA": ai_note})
+                st.rerun()
+    if st.session_state.journal:
+        st.dataframe(pd.DataFrame(st.session_state.journal), hide_index=True, width="stretch")
+        st.download_button("Exporter le journal en JSON", json.dumps(st.session_state.journal, ensure_ascii=False, indent=2),
+                           file_name="nextchallenge_journal.json", mime="application/json")
+    st.write("**Rendez-vous de travail sur NextWise**")
+    st.caption("Repères personnels pour ta revue : ni points acquis ni synchronisation avec la plateforme.")
+    st.checkbox("Consulter les informations et le dashboard NextWise", key="review_info")
+    st.checkbox("Faire les quiz disponibles", key="review_quiz")
+    st.checkbox("Préparer une contribution argumentée pour le chat individuel", key="review_chat")
+    st.checkbox("Réexaminer les thèses après les nouvelles d’entreprise", key="review_thesis")
+    st.write(f"[Règles et critères officiels]({RULES_URL}) · Rendement, risque, diversification et participation sont évalués. Les pondérations détaillées du barème n’ont pas été identifiées dans la page consultée.")
+    with st.expander("Méthode et limites"):
+        st.write("Positions et cash sont saisis manuellement. Les prix bruts servent à la valorisation ; les historiques ajustés servent au risque et aux signaux. Le portefeuille ne se synchronise pas après un ordre NextWise.")
+        st.write("Sans historique quotidien réel de valorisation et de flux, ton Sharpe réalisé au concours ne peut pas être calculé ici. Le parcours affiché simule l’allocation actuelle rééquilibrée chaque jour, sans frais, sur l’historique commun disponible.")
+        st.write("Secteurs indicatifs, sans détail des constituants de l’ETF. Les contrôles portent sur le mode solo ; la règle 5/10/40 du règlement concerne les clubs.")
+        st.markdown("Sources techniques : [yfinance](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html), "
+                    "[Sharpe](https://web.stanford.edu/~wfsharpe/art/sr/sr.htm), "
+                    "[allocation du risque](https://arxiv.org/abs/0708.2542), "
+                    "[ratio de diversification](https://www.tobam.fr/wp-content/docs/GROUND_RULES/en/TOBAM%20Maximum%20Diversification%20Equity%20Index%20Series%20Ground%20Rules_March2022.pdf).")
