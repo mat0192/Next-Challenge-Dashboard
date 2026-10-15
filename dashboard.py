@@ -21,7 +21,7 @@ company_names = {
 }
 
 # ⚠️ Modifie ce chiffre avec les liquidités (cash) exactes qu'il te reste sur NextWise
-liquidites_actuelles = 10378.07
+liquidites_actuelles = 8662.64
 
 @st.cache_data(ttl=300)
 def load_data():
