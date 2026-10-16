@@ -7,8 +7,9 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from portfolio_config import INITIAL_CAPITAL, INITIAL_CASH, RULES_URL, RULES_CHECKED, SECTORS, default_holdings, validate_holdings, validate_backup
+from portfolio_config import RULES_URL, RULES_CHECKED, SECTORS, validate_holdings
 from portfolio_math import allocation, market_panels, risk_metrics, max_buy_quantity, simulate_order, wilder_rsi
+from portfolio_storage import sync_portfolio, backup_controls
 
 st.set_page_config(page_title="NextChallenge Solo · Pilotage", page_icon="📊", layout="wide")
 
@@ -32,27 +33,22 @@ def load_data(tickers):
     return result, datetime.now(ZoneInfo("Europe/Paris")).isoformat()
 
 
-if "pending_restore" in st.session_state:
-    for key, value in st.session_state.pop("pending_restore").items():
-        st.session_state[key] = value
-if "holdings" not in st.session_state:
-    st.session_state.holdings = default_holdings()
-if "journal" not in st.session_state:
-    st.session_state.journal = []
-
 st.title("NextChallenge Solo")
 st.caption("Comprendre ton portefeuille · Comparer une décision · Préparer le concours")
 with st.sidebar:
     st.header("Mon compte")
-    capital = st.number_input("Capital de référence (€)", min_value=0.01, value=INITIAL_CAPITAL,
+    sync_portfolio()
+    capital = st.number_input("Capital de référence (€)", min_value=0.01,
                               step=100.0, key="capital", help="Apport initial affiché par NextWise : ta capture indique 50 959,17 €.")
-    cash = st.number_input("Liquidités actuelles (€)", min_value=0.0, value=INITIAL_CASH, step=100.0, key="cash")
+    cash = st.number_input("Liquidités actuelles (€)", min_value=0.0, step=100.0, key="cash")
     rf_pct = st.number_input("Taux de référence du Sharpe (%/an)", min_value=0.0, max_value=20.0,
-                            value=0.0, step=0.25, key="rf", help="Hypothèse, pas un taux récupéré ni le paramètre officiel du concours. Cash supposé sans rémunération.")
+                            step=0.25, key="rf", help="Hypothèse, pas un taux récupéré ni le paramètre officiel du concours. Cash supposé sans rémunération.")
     if st.button("Actualiser les cours", width="stretch"):
         load_data.clear()
     st.caption("Cours Yahoo en cache 5 minutes. Les cours et résultats NextWise font référence pour le concours.")
-    st.caption("Modifications propres à ta session. Exporte ta sauvegarde dans Positions pour les conserver.")
+    st.caption("Actualiser les cours conserve tes quantités, PRU, liquidités et notes. Aucun ordre NextWise n’est synchronisé automatiquement.")
+    with st.expander("Sauvegarde et transfert"):
+        backup_controls()
     st.link_button("Règlement officiel", RULES_URL, width="stretch")
     st.caption(f"Consulté le {RULES_CHECKED} · Fin annoncée : 9 avril 2027.")
 
@@ -160,13 +156,13 @@ with positions_tab:
                   "Poids (%)": "{:.2f}", "Achat max (titres)": "{:.0f}"})
     st.caption("Achat max : cash et plafond de 15 % pour cette seule ligne. Ces capacités ne s’additionnent pas : chaque achat utilise le même cash. PnL latent hors gains/pertes réalisés.")
     with st.expander("Mettre à jour les quantités, PRU et valeurs"):
-        st.write("Reporte tes positions après exécution sur NextWise. Modifications limitées à cette session.")
+        st.write("Reporte tes positions et ton cash après exécution sur NextWise. Après validation, attends l’indication « Enregistré dans ce navigateur » avant de fermer la page.")
         with st.form("edit_holdings"):
             edited = st.data_editor(st.session_state.holdings, num_rows="dynamic", hide_index=True,
                                     column_config={"Secteur": st.column_config.SelectboxColumn(options=SECTORS, required=True),
                                                    "Quantité": st.column_config.NumberColumn(min_value=0, step=1, required=True),
                                                    "PRU (€)": st.column_config.NumberColumn(min_value=0, required=True)}, width="stretch")
-            apply_changes = st.form_submit_button("Appliquer à cette session")
+            apply_changes = st.form_submit_button("Enregistrer mes positions")
         if apply_changes:
             try:
                 st.session_state.holdings = validate_holdings(edited)
@@ -174,19 +170,7 @@ with positions_tab:
             except ValueError as exc:
                 st.error(str(exc))
         st.caption("Vérifie l’éligibilité NextWise, la devise EUR et le secteur des nouvelles valeurs. Les lignes à quantité nulle restent disponibles à la simulation.")
-    snapshot = dict(version=1, capital=float(capital), cash=float(cash), rf=float(rf_pct),
-                    holdings=st.session_state.holdings.to_dict(orient="records"), journal=st.session_state.journal)
-    st.download_button("Exporter ma sauvegarde (positions + journal)", json.dumps(snapshot, ensure_ascii=False, indent=2),
-                       file_name="nextchallenge_sauvegarde.json", mime="application/json")
-    imported = st.file_uploader("Restaurer une sauvegarde du dashboard", type=["json"])
-    if imported is not None and st.button("Restaurer dans cette session"):
-        try:
-            if imported.size > 2_000_000:
-                raise ValueError("Fichier trop volumineux (maximum 2 Mo).")
-            st.session_state.pending_restore = validate_backup(json.loads(imported.getvalue()))
-            st.rerun()
-        except (ValueError, KeyError, TypeError) as exc:
-            st.error(f"Sauvegarde non chargée : {exc}")
+    st.info("Sauvegarde JSON : ouvre « Sauvegarde et transfert » dans la barre latérale. Tes positions et ton cash sont conservés sur ce navigateur, indépendamment des cours.")
 
 with signals_tab:
     st.subheader("Lecture technique · constats, pas ordres d’achat")

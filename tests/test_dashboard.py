@@ -1,5 +1,7 @@
 from datetime import datetime
 from pathlib import Path
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 from zoneinfo import ZoneInfo
@@ -13,6 +15,30 @@ from portfolio_config import default_holdings, validate_backup
 
 
 APP = str(Path(__file__).resolve().parents[1] / "dashboard.py")
+
+
+class BrowserStore:
+    """Transport stub; the real JavaScript protocol is also tested with Node."""
+    def __init__(self):
+        self.raw = None
+        self.writes = []
+        self.error = False
+
+    def __call__(self, *, data, **kwargs):
+        if data["action"] == "idle":
+            return SimpleNamespace(result=None)
+        result = dict(id=data["id"], raw=self.raw)
+        if self.error:
+            result["status"] = "error"
+        elif data["action"] == "read":
+            result["status"] = "read"
+        elif self.raw not in (data["expected"], data["raw"]):
+            result["status"] = "conflict"
+        else:
+            self.raw = data["raw"]
+            self.writes.append(self.raw)
+            result.update(status="saved", raw=self.raw)
+        return SimpleNamespace(result=result)
 
 
 def fixture():
@@ -31,8 +57,12 @@ class DashboardTests(unittest.TestCase):
         st.cache_data.clear()
         self.data = fixture()
         self.download = patch("yfinance.download", return_value=self.data)
-        self.download.start()
+        self.download_mock = self.download.start()
         self.addCleanup(self.download.stop)
+        self.browser = BrowserStore()
+        self.storage = patch("portfolio_storage.bridge", side_effect=self.browser)
+        self.storage.start()
+        self.addCleanup(self.storage.stop)
 
     def app(self):
         return AppTest.from_file(APP, default_timeout=30).run()
@@ -100,11 +130,63 @@ class DashboardTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertTrue(any("S500.PA" in e.value for e in app.error))
             self.assertTrue(any(b.label == "Corriger les positions" for b in app.button))
+            self.assertTrue(any(b.label == "Exporter ma sauvegarde (positions + journal)" for b in app.get("download_button")))
         with patch("yfinance.download", return_value=self.data.tail(10)):
             st.cache_data.clear()
             app = self.app()
             self.assert_clean(app)
             self.assertTrue(any("Historique commun insuffisant" in w.value for w in app.warning))
+
+    def test_import_refresh_and_new_browser_session(self):
+        app = self.app()
+        backup = dict(version=1, holdings=default_holdings().to_dict("records"),
+                      cash=12345.67, capital=60000., rf=1.5,
+                      journal=[{"Thèse": "À conserver après fermeture"}])
+        backup["holdings"][-1]["Quantité"] = 479
+        app.session_state["pending_restore"] = validate_backup(backup)
+        app.run()
+        self.assert_clean(app)
+        saved = json.loads(self.browser.raw)
+        self.assertEqual(saved, backup)
+        before = app.metric[0].value
+        self.download_mock.return_value = self.data * 1.1
+        next(b for b in app.button if b.label == "Actualiser les cours").click().run()
+        self.assertNotEqual(app.metric[0].value, before)
+        self.assertEqual(json.loads(self.browser.raw), backup)
+        reopened = self.app()  # Empty Streamlit state, same browser storage.
+        self.assert_clean(reopened)
+        self.assertEqual(reopened.number_input(key="cash").value, 12345.67)
+        self.assertEqual(reopened.session_state["holdings"].iloc[-1]["Quantité"], 479)
+        self.assertEqual(reopened.session_state["journal"], backup["journal"])
+        reopened.number_input(key="cash").set_value(12000.).run()
+        self.assertEqual(json.loads(self.browser.raw)["cash"], 12000.)
+        self.assertEqual(self.app().number_input(key="cash").value, 12000.)
+
+    def test_invalid_storage_and_conflict_are_not_overwritten(self):
+        self.browser.raw = '{"version": 1, "holdings": []}'
+        original = self.browser.raw
+        app = self.app()
+        self.assert_clean(app)
+        self.assertEqual(self.browser.raw, original)
+        self.assertFalse(self.browser.writes)
+        self.assertTrue(any("illisible" in w.value for w in app.warning))
+        self.browser.raw = None
+        app = self.app()
+        external = json.loads(self.browser.raw)
+        external["cash"] = 15000.
+        self.browser.raw = json.dumps(external)
+        app.number_input(key="cash").set_value(12000.).run()
+        self.assertEqual(json.loads(self.browser.raw)["cash"], 15000.)
+        self.assertTrue(any("autre onglet" in w.value for w in app.warning))
+        self.assertEqual(self.app().number_input(key="cash").value, 15000.)
+
+    def test_blocked_storage_keeps_manual_export_available(self):
+        self.browser.error = True
+        app = self.app()
+        self.assert_clean(app)
+        self.assertTrue(any("ne permet pas" in w.value for w in app.warning))
+        self.assertFalse(self.browser.writes)
+        self.assertTrue(app.get("download_button"))
 
 
 if __name__ == "__main__":

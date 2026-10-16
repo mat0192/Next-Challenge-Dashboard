@@ -18,7 +18,15 @@ streamlit run dashboard.py
 - **Simulateur** : comparaison avant/après, contrôles de cash et de quantité, repères de diversification.
 - **Journal & concours** : raisonnement, invalidation, sources et revue personnelle.
 
-Le compte initial reprend les positions saisies et la base NextWise de 50 959,17 € avec 8 662,64 € de cash. Les modifications de positions, paramètres et notes restent propres à chaque session. Exporter le JSON dans Positions pour les conserver, puis restaurer ce fichier lors d'une prochaine session. Rien n'est écrit dans un fichier partagé du serveur ; aucune interaction ou transaction n'est envoyée à NextWise.
+Le compte initial reprend les positions saisies et la base NextWise de 50 959,17 € avec 10 654,39 € de cash et 480 Stellantis. `portfolio_config.py` est uniquement le point de départ lorsqu'aucune sauvegarde n'existe.
+
+Positions, PRU, liquidités, capital de référence, taux et journal sont automatiquement enregistrés dans le stockage local du navigateur. Attendre **« Enregistré dans ce navigateur »** avant de fermer la page. Au prochain chargement, la sauvegarde est lue et validée avant toute écriture ; elle prend priorité sur la configuration initiale. « Actualiser les cours » ne touche qu'au cache Yahoo.
+
+Le JSON contient le portefeuille, pas les cours. Restaurer une ancienne sauvegarde restaure donc les anciennes **quantités et liquidités**, valorisées avec les cours récupérés actuellement. Utiliser la sauvegarde la plus récente après un achat ou une vente. L'import remplace aussi le journal ; ce n'est pas une fusion.
+
+**Sauvegarde et transfert**, dans la barre latérale, permet d'exporter une copie ou de l'importer sur un autre appareil. Le stockage est propre au navigateur et à l'adresse de l'application : navigation privée, suppression des données du site ou changement d'appareil peuvent nécessiter cet import. Ces commandes restent disponibles même si Yahoo ne répond pas. Une erreur de stockage est affichée ; une sauvegarde illisible ou modifiée par un autre onglet n'est pas écrasée automatiquement. Modifier le portefeuille dans un seul onglet à la fois.
+
+Aucune donnée personnelle modifiée n'est enregistrée dans un fichier serveur partagé ou dans GitHub. Les données sont transmises à la session Streamlit pour les calculs. Aucune interaction ou transaction n'est envoyée à NextWise : reporter manuellement les positions et le cash après exécution des ordres.
 
 ## Conventions de calcul
 
@@ -43,6 +51,7 @@ Les secteurs sont indicatifs et modifiables. L'ETF diversifié est exclu du déc
 
 ```sh
 python -m unittest discover -s tests -v
+node --test tests/test_portfolio_storage.mjs
 ```
 
 Tests déterministes sans connexion Yahoo : valeurs analytiques de VaR/CVaR, additivité des contributions, ordre des indices, proportionnalité au cash, cas sans volatilité, repli initial, bornes de capacité d'achat, ventes totales et excessives, RSI, cours manquants, sauvegardes et parcours Streamlit.
