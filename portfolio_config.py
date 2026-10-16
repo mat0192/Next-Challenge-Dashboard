@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 INITIAL_CAPITAL = 50959.17
-INITIAL_CASH = 8662.64
+INITIAL_CASH = 10654.39
 RULES_URL = "https://www.nextwise.fr/R%C3%A8glement-du-Next-Challenge?lng=fr"
 RULES_CHECKED = "15/10/2026"
 SECTORS = ["Énergie", "Finance", "Santé", "Consommation discrétionnaire", "Industrie",
@@ -20,7 +20,7 @@ DEFAULT_HOLDINGS = [
     ["ASML.AS", "ASML Holding", "Technologie", 3, 1552.20],
     ["AI.PA", "Air Liquide", "Matériaux", 22, 170.98],
     ["ORA.PA", "Orange", "Télécommunications", 280, 13.84],
-    ["STLAP.PA", "Stellantis", "Consommation discrétionnaire", 980, 3.93],
+    ["STLAP.PA", "Stellantis", "Consommation discrétionnaire", 480, 3.93],
 ]
 COLUMNS = ["Code Yahoo", "Nom", "Secteur", "Quantité", "PRU (€)"]
 
