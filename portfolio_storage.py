@@ -1,11 +1,12 @@
 """Restore before writing; keep positions independent from the market-data cache."""
 import json
+import runpy
 from pathlib import Path
 from uuid import uuid4
 
 import streamlit as st
 
-from portfolio_config import INITIAL_CAPITAL, INITIAL_CASH, default_holdings, validate_backup
+from portfolio_config import validate_backup
 
 STORAGE_KEY = "nextchallenge.solo.portfolio.v1"
 bridge = st.components.v2.component(
@@ -27,9 +28,27 @@ def encode(state):
     return json.dumps(snapshot(state), ensure_ascii=False, sort_keys=True, allow_nan=False)
 
 
+def reference_portfolio():
+    # Read the deployed file, even if Python cached an older imported module.
+    config = runpy.run_path(str(Path(__file__).with_name("portfolio_config.py")))
+    return dict(capital=config["INITIAL_CAPITAL"], cash=config["INITIAL_CASH"], rf=0.,
+                holdings=config["default_holdings"](), journal=[])
+
+
+def is_legacy_portfolio(state, reference):
+    """Identify only the old starter holdings; never replace later edits silently."""
+    old = reference["holdings"].copy()
+    old.loc[old["Code Yahoo"] == "STLAP.PA", "Quantité"] = 980
+    columns = list(old.columns)
+    return (abs(float(state["cash"]) - 8662.64) < .005
+            and state["holdings"][columns].sort_values("Code Yahoo").reset_index(drop=True).equals(
+                old.sort_values("Code Yahoo").reset_index(drop=True)))
+
+
 def defaults(state):
-    for key, value in dict(capital=INITIAL_CAPITAL, cash=INITIAL_CASH, rf=0.,
-                           holdings=default_holdings(), journal=[]).items():
+    if all(key in state for key in ("capital", "cash", "rf", "holdings", "journal")):
+        return
+    for key, value in reference_portfolio().items():
         if key not in state:
             state[key] = value
 

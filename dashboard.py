@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,7 +10,7 @@ import yfinance as yf
 
 from portfolio_config import RULES_URL, RULES_CHECKED, SECTORS, validate_holdings
 from portfolio_math import allocation, market_panels, risk_metrics, max_buy_quantity, simulate_order, wilder_rsi
-from portfolio_storage import sync_portfolio, backup_controls
+from portfolio_storage import sync_portfolio, backup_controls, reference_portfolio, is_legacy_portfolio
 
 st.set_page_config(page_title="NextChallenge Solo · Pilotage", page_icon="📊", layout="wide")
 
@@ -34,23 +35,60 @@ def load_data(tickers):
 
 
 st.title("NextChallenge Solo")
-st.caption("Comprendre ton portefeuille · Comparer une décision · Préparer le concours")
+st.caption("Mes positions → les cours actuels → mes décisions · Interface simplifiée du 16 octobre")
 with st.sidebar:
-    st.header("Mon compte")
+    st.header("Sauvegarde")
     sync_portfolio()
-    capital = st.number_input("Capital de référence (€)", min_value=0.01,
+    # Cash is now account data, not an immediately saved sidebar widget.
+    st.session_state.cash = float(st.session_state.cash)
+    with st.expander("Réglages avancés"):
+        capital = st.number_input("Capital de référence (€)", min_value=0.01,
                               step=100.0, key="capital", help="Apport initial affiché par NextWise : ta capture indique 50 959,17 €.")
-    cash = st.number_input("Liquidités actuelles (€)", min_value=0.0, step=100.0, key="cash")
-    rf_pct = st.number_input("Taux de référence du Sharpe (%/an)", min_value=0.0, max_value=20.0,
+        rf_pct = st.number_input("Taux de référence du Sharpe (%/an)", min_value=0.0, max_value=20.0,
                             step=0.25, key="rf", help="Hypothèse, pas un taux récupéré ni le paramètre officiel du concours. Cash supposé sans rémunération.")
-    if st.button("Actualiser les cours", width="stretch"):
-        load_data.clear()
-    st.caption("Cours Yahoo en cache 5 minutes. Les cours et résultats NextWise font référence pour le concours.")
-    st.caption("Actualiser les cours conserve tes quantités, PRU, liquidités et notes. Aucun ordre NextWise n’est synchronisé automatiquement.")
     with st.expander("Sauvegarde et transfert"):
         backup_controls()
     st.link_button("Règlement officiel", RULES_URL, width="stretch")
     st.caption(f"Consulté le {RULES_CHECKED} · Fin annoncée : 9 avril 2027.")
+
+reference = reference_portfolio()
+legacy = is_legacy_portfolio(st.session_state, reference)
+if legacy:
+    st.warning("Tu vois encore l’ancienne base : 980 Stellantis et 8 662,64 € de cash. Ton fichier du 16 octobre indique 480 Stellantis et 10 654,39 € de cash.")
+    if st.button("Charger mes chiffres du 16 octobre", type="primary", width="stretch"):
+        st.session_state.pending_restore = dict(holdings=reference["holdings"], cash=reference["cash"])
+        st.rerun()
+
+st.subheader("Gérer mon portefeuille")
+st.write("**Après un achat ou une vente exécuté sur NextWise :** ouvre le formulaire ci-dessous, corrige les quantités et le cash, puis enregistre.")
+with st.expander("Modifier mon portefeuille — quantités et cash"):
+    st.caption("Recopie les chiffres de NextWise. Les cours de marché et la valeur totale se recalculent ensuite ; tu ne les saisis pas.")
+    # Reset the draft only when the saved account changes (import, edit or restore).
+    editor_version = sha256((st.session_state.holdings.to_json() + str(st.session_state.cash)).encode()).hexdigest()[:12]
+    with st.form("edit_portfolio"):
+        draft_cash = st.number_input("Liquidités actuelles sur NextWise (€)", min_value=0.0,
+                                     value=float(st.session_state.cash), step=1.0,
+                                     key=f"edit_cash_{editor_version}")
+        edited = st.data_editor(st.session_state.holdings, num_rows="dynamic", hide_index=True,
+                                key=f"edit_holdings_{editor_version}",
+                                column_config={"Secteur": st.column_config.SelectboxColumn(options=SECTORS, required=True),
+                                               "Quantité": st.column_config.NumberColumn(min_value=0, step=1, required=True),
+                                               "PRU (€)": st.column_config.NumberColumn(min_value=0, required=True)}, width="stretch")
+        apply_changes = st.form_submit_button("Enregistrer mon portefeuille", type="primary", width="stretch")
+    if apply_changes:
+        try:
+            updated = validate_holdings(edited)
+            if not np.isfinite(draft_cash):
+                raise ValueError("Le cash doit être un nombre valide.")
+            st.session_state.pending_restore = dict(holdings=updated, cash=float(draft_cash))
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    st.caption("Attends « Enregistré dans ce navigateur » avant de fermer. Vérifie l’éligibilité NextWise et la cotation en EUR pour toute nouvelle valeur.")
+
+st.button("Actualiser les cours", on_click=load_data.clear, width="stretch")
+st.caption("Pour consulter le marché : ce bouton récupère les prix Yahoo sans changer tes quantités ni ton cash. Il n’importe aucun ordre NextWise. Cours en cache 5 minutes.")
+cash = st.session_state.cash
 
 holdings = validate_holdings(st.session_state.holdings).set_index("Code Yahoo")
 names, sectors = holdings["Nom"].to_dict(), holdings["Secteur"].to_dict()
@@ -66,15 +104,7 @@ try:
 except Exception as exc:
     st.error(f"Données indisponibles : {exc}")
     st.info("Aucune position n’est exclue du total pour masquer un cours manquant. Réessaie avec Actualiser les cours.")
-    # Une mauvaise nouvelle ligne doit rester corrigeable, même sans cours.
-    with st.form("repair_holdings"):
-        repair = st.data_editor(st.session_state.holdings, num_rows="dynamic", width="stretch")
-        if st.form_submit_button("Corriger les positions"):
-            try:
-                st.session_state.holdings = validate_holdings(repair)
-                st.rerun()
-            except ValueError as error:
-                st.error(str(error))
+    st.info("Pour corriger une ligne, ouvre « Modifier mon portefeuille — quantités et cash » en haut de la page. Ta sauvegarde reste disponible à gauche.")
     st.stop()
 
 now = datetime.now(ZoneInfo("Europe/Paris"))
@@ -155,22 +185,7 @@ with positions_tab:
                   "Cours Yahoo (€)": "{:.2f}", "Capital (€)": "{:,.2f}", "PnL latent (€)": "{:+,.2f}",
                   "Poids (%)": "{:.2f}", "Achat max (titres)": "{:.0f}"})
     st.caption("Achat max : cash et plafond de 15 % pour cette seule ligne. Ces capacités ne s’additionnent pas : chaque achat utilise le même cash. PnL latent hors gains/pertes réalisés.")
-    with st.expander("Mettre à jour les quantités, PRU et valeurs"):
-        st.write("Reporte tes positions et ton cash après exécution sur NextWise. Après validation, attends l’indication « Enregistré dans ce navigateur » avant de fermer la page.")
-        with st.form("edit_holdings"):
-            edited = st.data_editor(st.session_state.holdings, num_rows="dynamic", hide_index=True,
-                                    column_config={"Secteur": st.column_config.SelectboxColumn(options=SECTORS, required=True),
-                                                   "Quantité": st.column_config.NumberColumn(min_value=0, step=1, required=True),
-                                                   "PRU (€)": st.column_config.NumberColumn(min_value=0, required=True)}, width="stretch")
-            apply_changes = st.form_submit_button("Enregistrer mes positions")
-        if apply_changes:
-            try:
-                st.session_state.holdings = validate_holdings(edited)
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-        st.caption("Vérifie l’éligibilité NextWise, la devise EUR et le secteur des nouvelles valeurs. Les lignes à quantité nulle restent disponibles à la simulation.")
-    st.info("Sauvegarde JSON : ouvre « Sauvegarde et transfert » dans la barre latérale. Tes positions et ton cash sont conservés sur ce navigateur, indépendamment des cours.")
+    st.caption("Pour modifier tes positions et le cash : utilise « Modifier mon portefeuille — quantités et cash » tout en haut de la page.")
 
 with signals_tab:
     st.subheader("Lecture technique · constats, pas ordres d’achat")

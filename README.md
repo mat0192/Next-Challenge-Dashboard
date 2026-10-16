@@ -2,6 +2,17 @@
 
 Dashboard Streamlit de suivi de portefeuille et de simulation d'ordres.
 
+## Pour utiliser le dashboard
+
+Ouvrir **https://mathis-nextchallenge.streamlit.app/**. Aucun fichier GitHub n'est à modifier pour suivre le portefeuille.
+
+1. Si l'ancienne base (980 Stellantis / 8 662,64 €) apparaît, cliquer sur **Charger mes chiffres du 16 octobre** en haut de page. Le journal est conservé.
+2. Pour consulter le marché, cliquer sur **Actualiser les cours**.
+3. Après un ordre exécuté sur NextWise, ouvrir **Modifier mon portefeuille — quantités et cash**, reporter les chiffres et cliquer sur **Enregistrer mon portefeuille**.
+4. Attendre **Enregistré dans ce navigateur**. La prochaine visite dans ce navigateur reprend ces chiffres.
+
+Les fichiers ci-dessous forment le code de l'application : ils ne sont pas des documents à remplir. Les sections suivantes concernent son fonctionnement technique.
+
 ## Démarrage
 
 ```sh

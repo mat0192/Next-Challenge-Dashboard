@@ -71,6 +71,10 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(app.exception, [e.message for e in app.exception])
         self.assertEqual(len(app.tabs), 6)
 
+    def set_cash(self, app, value):
+        next(w for w in app.number_input if w.label == "Liquidités actuelles sur NextWise (€)").set_value(value)
+        next(b for b in app.button if b.label == "Enregistrer mon portefeuille").click().run()
+
     def test_all_tabs_and_twenty_simulations(self):
         app = self.app()
         self.assert_clean(app)
@@ -116,7 +120,7 @@ class DashboardTests(unittest.TestCase):
         app.session_state["pending_restore"] = validate_backup(backup)
         app.run()
         self.assert_clean(app)
-        self.assertEqual(app.number_input(key="cash").value, 10000.)
+        self.assertEqual(app.session_state["cash"], 10000.)
         self.assertEqual(app.number_input(key="capital").value, 60000.)
         self.assertEqual(len(app.session_state["journal"]), 1)
 
@@ -129,7 +133,7 @@ class DashboardTests(unittest.TestCase):
             app = self.app()
             self.assertFalse(app.exception)
             self.assertTrue(any("S500.PA" in e.value for e in app.error))
-            self.assertTrue(any(b.label == "Corriger les positions" for b in app.button))
+            self.assertTrue(any(b.label == "Enregistrer mon portefeuille" for b in app.button))
             self.assertTrue(any(b.label == "Exporter ma sauvegarde (positions + journal)" for b in app.get("download_button")))
         with patch("yfinance.download", return_value=self.data.tail(10)):
             st.cache_data.clear()
@@ -155,12 +159,12 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(json.loads(self.browser.raw), backup)
         reopened = self.app()  # Empty Streamlit state, same browser storage.
         self.assert_clean(reopened)
-        self.assertEqual(reopened.number_input(key="cash").value, 12345.67)
+        self.assertEqual(reopened.session_state["cash"], 12345.67)
         self.assertEqual(reopened.session_state["holdings"].iloc[-1]["Quantité"], 479)
         self.assertEqual(reopened.session_state["journal"], backup["journal"])
-        reopened.number_input(key="cash").set_value(12000.).run()
+        self.set_cash(reopened, 12000.)
         self.assertEqual(json.loads(self.browser.raw)["cash"], 12000.)
-        self.assertEqual(self.app().number_input(key="cash").value, 12000.)
+        self.assertEqual(self.app().session_state["cash"], 12000.)
 
     def test_invalid_storage_and_conflict_are_not_overwritten(self):
         self.browser.raw = '{"version": 1, "holdings": []}'
@@ -175,10 +179,45 @@ class DashboardTests(unittest.TestCase):
         external = json.loads(self.browser.raw)
         external["cash"] = 15000.
         self.browser.raw = json.dumps(external)
-        app.number_input(key="cash").set_value(12000.).run()
+        self.set_cash(app, 12000.)
         self.assertEqual(json.loads(self.browser.raw)["cash"], 15000.)
         self.assertTrue(any("autre onglet" in w.value for w in app.warning))
-        self.assertEqual(self.app().number_input(key="cash").value, 15000.)
+        self.assertEqual(self.app().session_state["cash"], 15000.)
+
+    def test_one_click_legacy_recovery_preserves_journal(self):
+        holdings = default_holdings()
+        holdings.loc[holdings["Code Yahoo"] == "STLAP.PA", "Quantité"] = 980
+        journal = [{"Thèse": "Note existante à garder"}]
+        self.browser.raw = json.dumps(dict(version=1, capital=50959.17, cash=8662.64,
+                                          rf=2., holdings=holdings.to_dict("records"), journal=journal))
+        app = self.app()
+        self.assert_clean(app)
+        self.assertEqual(app.session_state["cash"], 8662.64)  # No silent overwrite.
+        next(b for b in app.button if b.label == "Charger mes chiffres du 16 octobre").click().run()
+        self.assert_clean(app)
+        self.assertEqual(app.session_state["cash"], 10654.39)
+        self.assertEqual(app.session_state["holdings"].iloc[-1]["Quantité"], 480)
+        self.assertEqual(app.session_state["journal"], journal)
+        self.assertEqual(app.session_state["rf"], 2.)
+        reopened = self.app()
+        self.assertEqual(reopened.session_state["cash"], 10654.39)
+        self.assertFalse(any(b.label == "Charger mes chiffres du 16 octobre" for b in reopened.button))
+
+    def test_single_form_saves_cash_and_holdings_atomically(self):
+        app = self.app()
+        original = json.loads(self.browser.raw)
+        invalid = default_holdings()
+        invalid.loc[0, "Quantité"] = -1
+        with patch("streamlit.data_editor", return_value=invalid):
+            self.set_cash(app, 12000.)
+        self.assertEqual(json.loads(self.browser.raw), original)
+        changed = default_holdings()
+        changed.loc[0, "Quantité"] = 28
+        with patch("streamlit.data_editor", return_value=changed):
+            self.set_cash(app, 12000.)
+        saved = json.loads(self.browser.raw)
+        self.assertEqual(saved["cash"], 12000.)
+        self.assertEqual(saved["holdings"][0]["Quantité"], 28)
 
     def test_blocked_storage_keeps_manual_export_available(self):
         self.browser.error = True
